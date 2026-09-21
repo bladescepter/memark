@@ -4,4 +4,4 @@ node_modules/
 .pi/hindsight/
 
 # Hindsight 迁移评审材料（含个人内容，不入可公开仓库历史）
-hindsight-*-export.md
+hindsight-*.md
