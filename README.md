@@ -32,8 +32,8 @@ ln -s ~/DEV/memark ~/.pi/agent/extensions/memark
 
 ### v0.1（当前）
 
-- `memark_recall` 工具：按任务检索记忆仓库，经 INDEX.md 路由后返回相关记忆正文；仓库未初始化时明确报告并放行，不阻塞任务
-- `/memory` 命令：仓库状态（索引条目、五层计数、pending、git 状态）
+- `memark_recall` 工具：按任务检索记忆仓库，默认范围 = 个人区 INDEX + 当前项目 `projects/<项目名>/INDEX.md`；经索引路由后返回相关记忆正文；仓库未初始化时明确报告并放行，不阻塞任务
+- `/memory` 命令：仓库状态（个人区索引条目、五层计数、项目区各项目计数、pending、git 状态）
 
 ### 计划
 
