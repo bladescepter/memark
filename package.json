@@ -1,0 +1,18 @@
+{
+  "name": "memark",
+  "version": "0.1.0",
+  "description": "memark (memory + markdown) — long-term memory extension for the pi coding agent: recall tool, curator gate, /memory commands.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi",
+    "pi-package",
+    "memory",
+    "markdown"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
