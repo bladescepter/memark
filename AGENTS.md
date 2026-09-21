@@ -20,16 +20,17 @@ memark = **mem**ory + **m**arkdown，pi 编码代理的长期记忆扩展。
 ## 当前状态（截至 2026-09-21）
 
 - v0.1（commit `2a6b46b`）：`memark_recall` 工具（INDEX.md 路由 → 读取正文，含路径逃逸防护与截断）+ `/memory` 命令（分层计数、pending、git 状态）；Gate（v0.2）在 index.ts 中留有明确未启用注记
-- 扩展尚未挂载到 pi（未创建 `~/.pi/agent/extensions/memark` symlink）
-- memory 仓库不存在，recall 现在调用会报「仓库未初始化」——预期行为，不阻塞任务
+- memory 私有仓库已创建并推送：`git@github.com:bladescepter/memory.git`，本地路径 `~/DEV/memory`，初始协议 commit `1ad6d0d`
+- P1 已完成：五层目录、根/分层 README 路由、frontmatter 规范、INDEX 生成、schema/secret/重复/链接校验、pre-commit hook 和单元测试均已建立；尚无正式记忆
+- memark 扩展已通过 `~/.pi/agent/extensions/memark` symlink 挂载；当前会话需执行 `/reload` 后才会加载
 - Hindsight 侧：心智模型刷新已由用户关闭；自动 retain 与查询能力迁移期保留（只读迁移源，不做任何自动写入）
 - Jev（typesafe.ai）early access 尚未申请；接入前须先完成 200–500 轮标注评测（方案 §12）
 
 ## 下一步
 
-1. **P1**：创建 memory 仓库——五层目录（identity / principles / preferences / context / knowledge）+ 根 README 路由协议 + INDEX 生成与 frontmatter/secret 校验脚本 + GitHub 私有 remote
-2. 挂载 memark（symlink 或 settings.json extensions）
-3. **P2**：从 Hindsight「用户偏好」心智模型提炼首批记忆，用户逐条审核后入库，recall 即可真实工作
+1. 完成扩展挂载并验证 `/memory` 能看到空的、校验通过的 `~/DEV/memory`
+2. **P2**：从 Hindsight「用户偏好」心智模型提炼首批记忆，用户逐条审核后入库
+3. 用首批已批准记忆验证 `memark_recall` 的真实检索流程
 
 ## 本项目纪律
 

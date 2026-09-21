@@ -31,7 +31,7 @@ function countMd(dir: string): number {
 	for (const e of readdirSync(dir, { withFileTypes: true })) {
 		const p = join(dir, e.name);
 		if (e.isDirectory()) n += countMd(p);
-		else if (e.name.endsWith(".md")) n += 1;
+		else if (e.name.endsWith(".md") && e.name !== "README.md") n += 1;
 	}
 	return n;
 }
