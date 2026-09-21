@@ -23,15 +23,16 @@ memark = **mem**ory + **m**arkdown，pi 编码代理的长期记忆扩展。
 - memory 私有仓库已创建并推送：`git@github.com:bladescepter/memory.git`，本地路径 `~/DEV/memory`，初始协议 commit `1ad6d0d`
 - P1 已完成：五层目录、根/分层 README 路由、frontmatter 规范、INDEX 生成、schema/secret/重复/链接校验、pre-commit hook 和单元测试均已建立；尚无正式记忆
 - 2026-09-21 协议升级为单仓双区：个人区（五层，跨项目有效）+ 项目区 `projects/<项目名>/`（decisions/topics/incidents/handoffs，单项目有效，scope: project）；方案 §4.2 已同步改写；memory 仓库 commit `c17946e`，memark recall 已支持项目区索引
+- 2026-09-21 P2 首批完成：从 Hindsight 心智模型提炼的 67 条记忆经用户逐条审核后入库（个人区 8、newswrite 6、cmnrag 14、proofreading 17、wiki 22，共 71 个 commit 推送）；观察拆条（768 条）经审核决定不迁移，仅作本地评审参考 `hindsight-migration-candidates.md`（已 gitignore）
 - memark 扩展已通过 `~/.pi/agent/extensions/memark` symlink 挂载；当前会话需执行 `/reload` 后才会加载
 - Hindsight 侧：心智模型刷新已由用户关闭；自动 retain 与查询能力迁移期保留（只读迁移源，不做任何自动写入）
 - Jev（typesafe.ai）early access 尚未申请；接入前须先完成 200–500 轮标注评测（方案 §12）
 
 ## 下一步
 
-1. 完成扩展挂载并验证 `/memory` 能看到空的、校验通过的 `~/DEV/memory`
-2. **P2**：从 Hindsight「用户偏好」心智模型提炼首批记忆，用户逐条审核后入库；跨项目的入个人区，单项目的入对应 `projects/<项目名>/`
-3. 用首批已批准记忆验证 `memark_recall` 的真实检索流程
+1. 用首批已批准记忆验证 `memark_recall` 的真实检索流程（`/reload` 后在不同项目目录下测试个人区+项目区召回）
+2. P3：完善 memark 扩展（curator 候选审核、diff、批准、拒绝、归档、回滚）
+3. 日常使用中积累新记忆，验证准入与去重流程
 
 ## 本项目纪律
 
