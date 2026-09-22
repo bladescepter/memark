@@ -54,10 +54,76 @@ function projectDirFor(cwd?: string): string | null {
 	return existsSync(join(dir, "INDEX.md")) ? dir : null;
 }
 
-/** 从 INDEX 条目行解析记忆文件相对路径（行尾最后一个 " — " 之后、以 .md 结尾的部分） */
+/** 从 INDEX 条目行解析记忆文件相对路径（行尾最后一个 “ — ” 之后、以 .md 结尾的部分） */
 function pathFromIndexLine(line: string): string | null {
 	const m = line.match(/—\s*(\S+\.md)\s*$/);
 	return m ? m[1] : null;
+}
+
+/** 解析 INDEX 条目行：- [Type] title — description — tags: a, b — path.md */
+function parseIndexLine(line: string): { title: string; description: string; tags: string } | null {
+	const m = line.match(/^- \[[^\]]+\]\s+(.*)$/);
+	if (!m) return null;
+	const pm = m[1].match(/—\s*(\S+\.md)\s*$/);
+	if (!pm) return null;
+	const body = m[1].slice(0, pm.index ?? 0).trimEnd();
+	const parts = body.split(/\s+—\s+/);
+	if (parts.length < 2) return null;
+	const tags = (parts.length >= 3 ? parts[parts.length - 1] : "").replace(/^tags:\s*/, "");
+	const description = parts[parts.length - 2] ?? "";
+	const title = parts[0] ?? "";
+	return { title, description, tags };
+}
+
+/**
+ * 对 INDEX 行做相关性匹配并排序：标题命中权重最高，其次描述、tags；
+ * 多词全部命中加成。返回去重后的相对路径，按分数降序。
+ */
+export function matchIndexLines(lines: string[], query: string): string[] {
+	const tokens = query.split(/\s+/).filter(Boolean).map((t) => t.toLowerCase());
+	if (tokens.length === 0) return [];
+	const lowerQuery = query.toLowerCase();
+	const scored: { path: string; score: number; order: number }[] = [];
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i];
+		if (!line.includes(".md")) continue;
+		const low = line.toLowerCase();
+		const anyHit =
+			tokens.some((t) => low.includes(t)) || (tokens.length > 1 && low.includes(lowerQuery));
+		if (!anyHit) continue;
+		const parsed = parseIndexLine(line);
+		const rel = pathFromIndexLine(line);
+		if (!rel) continue;
+		let score = 1;
+		let tokenHits = 0;
+		if (parsed) {
+			const title = parsed.title.toLowerCase();
+			const desc = parsed.description.toLowerCase();
+			const tags = parsed.tags.toLowerCase();
+			score = 0;
+			for (const t of tokens) {
+				if (title.includes(t)) {
+					score += 3;
+					tokenHits++;
+				} else if (desc.includes(t)) {
+					score += 2;
+					tokenHits++;
+				} else if (tags.includes(t)) {
+					score += 1;
+					tokenHits++;
+				} else {
+					score += 1; // 仅路径或其他位置命中
+				}
+			}
+			if (tokens.length > 1 && tokenHits === tokens.length) score += 2;
+		}
+		if (tokens.length > 1 && low.includes(lowerQuery)) score += 2;
+		scored.push({ path: rel, score, order: i });
+	}
+	return scored
+		.sort((a, b) => b.score - a.score || a.order - b.order)
+		.map((s) => s.path)
+		.filter((p, i, arr) => arr.indexOf(p) === i);
 }
 
 export default function (pi: ExtensionAPI) {
@@ -96,21 +162,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const lines = [...personalLines, ...projectLines];
-			const tokens = params.query.split(/\s+/).filter(Boolean);
-			const lowerQuery = params.query.toLowerCase();
-			const matched: string[] = [];
-			for (const line of lines) {
-				if (!line.includes(".md")) continue;
-				const lower = line.toLowerCase();
-				const hit =
-					tokens.some((t) => lower.includes(t.toLowerCase())) ||
-					(tokens.length > 1 && lower.includes(lowerQuery));
-				if (!hit) continue;
-				const rel = pathFromIndexLine(line);
-				if (rel) matched.push(rel);
-			}
-
-			const uniq = [...new Set(matched)].slice(0, params.max_files ?? 3);
+			const uniq = matchIndexLines(lines, params.query).slice(0, params.max_files ?? 3);
 			if (uniq.length === 0) {
 				const summary = lines.filter((l) => l.includes(".md")).slice(0, 40).join("\n");
 				const scopeNote = projectDir ? "（含当前项目区）" : "";
