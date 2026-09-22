@@ -28,9 +28,11 @@ const exec = (cmd, args) =>
 
 const tools = {};
 const commands = {};
+const handlers = {};
 const pi = {
 	registerTool: (d) => (tools[d.name] = d),
 	registerCommand: (n, o) => (commands[n] = o),
+	on: (ev, fn) => (handlers[ev] = fn),
 	exec,
 };
 mod.default(pi);
@@ -175,6 +177,11 @@ const assert = (cond, msg) => {
 	await git(["push"]);
 	const diff2 = await git(["diff", before, "HEAD"]);
 	assert(diff2.stdout.trim() === "", "全部回滚后与基线一致");
+
+	// ---- 10. session_start 自动同步（静默 pull，不 push） ----
+	assert(typeof handlers.session_start === "function", "session_start handler 已注册");
+	await handlers.session_start(); // 不应抛错（离线/分叉均静默）
+	assert((await git(["status", "--porcelain"])).stdout.trim() === "", "session_start 同步后工作区干净");
 
 	console.log("\n全部 P3 测试通过");
 })().catch((e) => {

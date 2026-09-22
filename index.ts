@@ -17,7 +17,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve, basename } from "node:path";
-import { PROJECTS_DIR, REPO, readIndex } from "./repo";
+import { PROJECTS_DIR, REPO, git, readIndex } from "./repo";
 import { handleMemoryCommand, listPendingIds, registerCurator } from "./curator";
 
 const MAX_FILE_CHARS = 4000;
@@ -169,6 +169,17 @@ export default function (pi: ExtensionAPI) {
 
 	// ---------- curator（P3） ----------
 	registerCurator(pi);
+
+	// ---------- 会话启动自动同步（折中方案） ----------
+	// 只做后台静默 pull --ff-only：保障 recall 新鲜度；不 push、不修索引；
+	// 任何失败（离线、分叉、无远端）静默跳过，不影响会话。完整同步仍用 /memory sync。
+	pi.on("session_start", async () => {
+		try {
+			await git(pi, ["pull", "--ff-only", "--quiet"]);
+		} catch {
+			// 静默降级（方案 §11.4）：同步失败不阻塞会话
+		}
+	});
 
 	// ---------- /memory 命令族 ----------
 	pi.registerCommand("memory", {
