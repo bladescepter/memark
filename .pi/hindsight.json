@@ -1,0 +1,11 @@
+{
+  "mentalModels": {
+    "inject": false
+  },
+  "recall": {
+    "enabled": false
+  },
+  "retain": {
+    "enabled": false
+  }
+}

@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+repo=$(git rev-parse --show-toplevel)
+cd "$repo"
+python3 scripts/secret_scan.py
+python3 scripts/validate.py
+python3 scripts/generate_index.py --check

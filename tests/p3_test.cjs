@@ -1,190 +1,325 @@
-/* memark P3 curator 全流程回归测试。
- * 用法：sh tests/run.sh（自动搭建隔离 git 环境，不触碰真实 memory 仓库）
- * 依赖：全局安装的 pi（npm root -g 下 @earendil-works/pi-coding-agent/node_modules 提供 jiti/typebox）
+/* memark 安全写入与 recall 回归测试。
+ * 由 tests/run.sh 在完全虚构、隔离的 git 仓库中运行。
  */
-process.env.MEMARK_REPO = process.env.TEST_REPO || "/tmp/memark-test-repo";
+process.env.MEMARK_REPO = process.env.TEST_REPO;
 const { execSync } = require("node:child_process");
+const { execFile } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 
-const G =
-	process.env.PI_NODE_MODULES ||
-	path.join(execSync("npm root -g").toString().trim(), "@earendil-works/pi-coding-agent/node_modules");
+const G = process.env.PI_NODE_MODULES;
 const { createJiti } = require(path.join(G, "jiti"));
 const jiti = createJiti(__filename, {
-	alias: { "@earendil-works/pi-ai": path.join(__dirname, "stub-pi-ai.cjs") },
+	alias: {
+		"@earendil-works/pi-ai": path.join(__dirname, "stub-pi-ai.cjs"),
+		"@earendil-works/pi-coding-agent": path.join(__dirname, "stub-pi-coding-agent.cjs"),
+	},
 });
 const mod = jiti(path.join(__dirname, "..", "index.ts"));
+const repoMod = jiti(path.join(__dirname, "..", "repo.ts"));
 
-const { execFile } = require("node:child_process");
 const REPO = process.env.MEMARK_REPO;
-const BARE = process.env.TEST_REMOTE || "/tmp/memark-test-remote.git";
-const exec = (cmd, args) =>
-	new Promise((res) =>
-		execFile(cmd, args, { timeout: 60000 }, (err, stdout, stderr) =>
-			res({ stdout: String(stdout || ""), stderr: String(stderr || ""), code: err ? err.code ?? 1 : 0, killed: false }),
-		),
-	);
+const BARE = process.env.TEST_REMOTE;
+const BASE = path.dirname(REPO);
+let pullCount = 0;
+const exec = (cmd, args, options = {}) =>
+	new Promise((resolve) => {
+		if (cmd === "git" && args.includes("pull")) pullCount++;
+		execFile(
+			cmd,
+			args,
+			{ timeout: options.timeout ?? 60000, signal: options.signal },
+			(err, stdout, stderr) => resolve({
+				stdout: String(stdout || ""),
+				stderr: String(stderr || ""),
+				code: err ? err.code ?? 1 : 0,
+				killed: Boolean(err?.killed),
+			}),
+		);
+	});
 
 const tools = {};
 const commands = {};
 const handlers = {};
+const entries = [];
 const pi = {
-	registerTool: (d) => (tools[d.name] = d),
-	registerCommand: (n, o) => (commands[n] = o),
-	on: (ev, fn) => (handlers[ev] = fn),
+	registerTool: (definition) => (tools[definition.name] = definition),
+	registerCommand: (name, options) => (commands[name] = options),
+	on: (event, handler) => (handlers[event] = handler),
+	appendEntry: (customType, data) => entries.push({ customType, data }),
 	exec,
 };
 mod.default(pi);
 
-let confirmed = 0;
+let confirmImpl = async () => true;
+const notes = [];
 const ctx = {
 	hasUI: true,
 	ui: {
-		confirm: async (t) => {
-			confirmed++;
-			console.log(`  [confirm#${confirmed}] ${t}`);
-			return true;
+		confirm: async (title, message) => confirmImpl(title, message),
+		notify: (message) => {
+			notes.push(String(message));
+			console.log(`  [notify] ${String(message).split("\n")[0]}`);
 		},
-		notify: (m) => console.log(`  [notify] ${String(m).split("\n")[0]}`),
 	},
-	cwd: "/tmp",
+	cwd: "/workspace/none",
 };
 
 const git = (args) => exec("git", ["-C", REPO, ...args]);
-const assert = (cond, msg) => {
-	if (!cond) {
-		console.error(`✗ FAIL: ${msg}`);
+const shell = (command) => execSync(command, { stdio: "pipe" }).toString();
+const assert = (condition, message) => {
+	if (!condition) {
+		console.error(`✗ FAIL: ${message}`);
 		process.exit(1);
 	}
-	console.log(`✓ ${msg}`);
+	console.log(`✓ ${message}`);
 };
+const toolText = (result) => result.content[0].text;
+const pendingFiles = () => fs.readdirSync(path.join(REPO, "pending")).filter((file) => file.endsWith(".md") && file !== "README.md");
+const remember = (params, context = ctx) => tools.memark_remember.execute("test", params, undefined, undefined, context);
+
+function addRemoteMemory() {
+	const other = path.join(BASE, "remote-writer");
+	shell(`git clone -q "${BARE}" "${other}"`);
+	shell(`git -C "${other}" config user.email test@memark.local`);
+	shell(`git -C "${other}" config user.name memark-test`);
+	const file = path.join(other, "preferences", "远端同步标记.md");
+	fs.writeFileSync(file, `---\ntype: Preference\ntitle: 远端同步标记\ndescription: 仅用于确认首次 recall 会先同步远端\nstatus: active\nprivacy: internal\ntags: [同步, 测试]\ntimestamp: 2026-09-22\nsource: user-confirmed\nreviewed: true\n---\n\n远端同步唯一正文标记。\n`);
+	shell(`python3 "${other}/scripts/generate_index.py" --root "${other}"`);
+	shell(`git -C "${other}" add -- preferences/远端同步标记.md INDEX.md`);
+	shell(`git -C "${other}" commit -q -m "memory: remote recall fixture"`);
+	shell(`git -C "${other}" push -q`);
+}
 
 (async () => {
-	// 回归：recall 排序
-	const idx = fs.readFileSync(path.join(REPO, "INDEX.md"), "utf8").split("\n");
-	assert(mod.matchIndexLines(idx, "备份")[0] === "principles/清理前先备份.md", "recall 排序回归通过");
+	// 1. 纯函数与安全路径。
+	const lines = fs.readFileSync(path.join(REPO, "INDEX.md"), "utf8").split("\n");
+	assert(mod.matchIndexLines(lines, "备份")[0] === "principles/清理前先备份.md", "recall 标题排序正确");
+	assert(mod.matchIndexLines(lines, "不存在 备份")[0] === "principles/清理前先备份.md", "未命中关键词不再错误加分");
+	assert(repoMod.filenameFromTitle("Windows: 文件?") === "Windows-文件-", "标题会转换为跨平台安全文件名");
+	let escaped = false;
+	try { repoMod.resolveRepoPath("../outside.md"); } catch { escaped = true; }
+	assert(escaped, "安全路径拒绝 .. 越出记忆仓库");
+	escaped = false;
+	try { repoMod.resolveRepoPath("C:\\Windows\\outside.md"); } catch { escaped = true; }
+	assert(escaped, "在非 Windows 环境也能识别并拒绝 Windows 绝对路径");
 
-	// ---- 1. Handoff 缺 expires 应直接报错 ----
+	// 2. 第一次 recall 才同步，之后不重复；会话开始不再同步。
+	assert(handlers.session_start === undefined, "不再在会话开始时自动同步");
+	addRemoteMemory();
+	let result = await tools.memark_recall.execute("r1", { query: "远端同步唯一正文", max_files: 2 }, undefined, undefined, { cwd: "/workspace/none" });
+	assert(toolText(result).includes("远端同步标记"), "第一次 recall 先拉取远端再检索");
+	assert(pullCount === 1, "第一次 recall 只同步一次");
+	await tools.memark_recall.execute("r2", { query: "备份" }, undefined, undefined, { cwd: "/workspace/none" });
+	assert(pullCount === 1, "同一会话后续 recall 不重复同步");
+	result = await tools.memark_recall.execute("r3", { query: "单写者", max_files: 2 }, undefined, undefined, { cwd: "/workspace/wiki/subdir" });
+	assert(toolText(result).includes("projects/wiki/topics/单写者纪律.md"), "从项目子目录也能识别当前项目");
+	result = await tools.memark_recall.execute("r4", { query: "跨项目唯一正文" }, undefined, undefined, { cwd: "/workspace/wiki" });
+	assert(!toolText(result).includes("其他项目秘密"), "默认 recall 不泄漏其他项目记忆");
+	result = await tools.memark_recall.execute("r5", { query: "跨项目唯一正文", all_projects: true }, undefined, undefined, { cwd: "/workspace/wiki" });
+	assert(toolText(result).includes("projects/other/topics/其他项目秘密.md"), "明确要求时可以跨项目 recall");
+	result = await tools.memark_recall.execute("r6", { query: "过期交接唯一正文" }, undefined, undefined, { cwd: "/workspace/wiki" });
+	assert(!toolText(result).includes("过期交接"), "已过期记忆不会出现在结果或摘要中");
+
+	const failTools = {};
+	const failPi = {
+		registerTool: (definition) => (failTools[definition.name] = definition),
+		registerCommand: () => {},
+		on: () => {},
+		appendEntry: () => {},
+		exec: (cmd, args, options) => cmd === "git" && args.includes("pull")
+			? Promise.resolve({ stdout: "", stderr: "offline", code: 1, killed: false })
+			: exec(cmd, args, options),
+	};
+	mod.default(failPi);
+	result = await failTools.memark_recall.execute("rf", { query: "备份" }, undefined, undefined, { cwd: "/workspace/none" });
+	assert(toolText(result).includes("自动同步失败") && toolText(result).includes("清理前先备份"), "同步失败时提示并继续使用本地记忆");
+
+	// 3. 输入校验。
 	try {
-		await tools.memark_remember.execute(
-			"t0",
-			{ title: "交接测试", description: "d", body: "b", tags: ["t"], zone: "project", project: "wiki", category: "handoffs", type: "Handoff" },
-			undefined, undefined, ctx,
-		);
-		assert(false, "Handoff 缺 expires 应抛错");
-	} catch (e) {
-		assert(String(e.message).includes("expires"), "Handoff 缺 expires 被拒绝");
+		await remember({ title: "交接测试", description: "d", body: "b", tags: ["t"], zone: "project", project: "wiki", category: "handoffs", type: "Handoff" });
+		assert(false, "Handoff 缺 expires 应失败");
+	} catch (error) {
+		assert(String(error.message).includes("expires"), "Handoff 缺 expires 被拒绝");
+	}
+	try {
+		await remember({ title: "日期测试", description: "d", body: "b", tags: ["t"], zone: "project", project: "wiki", category: "handoffs", type: "Handoff", expires: "2026-99-99" });
+		assert(false, "非法日期应失败");
+	} catch (error) {
+		assert(String(error.message).includes("真实"), "非法日历日期被拒绝");
+	}
+	try {
+		await remember({ title: "项目名测试", description: "d", body: "b", tags: ["t"], zone: "project", project: "wiki.", category: "topics", type: "Topic" });
+		assert(false, "Windows 不兼容项目名应失败");
+	} catch (error) {
+		assert(String(error.message).includes("跨平台合法"), "项目名拒绝 Windows 不允许的末尾句点");
 	}
 
-	// ---- 2. pending 写入 → review → reject ----
-	let r = await tools.memark_remember.execute(
-		"t1",
-		{ title: "P3 测试记忆", description: "curator 流程测试条目", body: "测试正文。", tags: ["测试"], zone: "personal", layer: "principles", type: "Principle", as_pending: true },
-		undefined, undefined, ctx,
-	);
-	console.log(`  [tool] ${r.content[0].text}`);
-	assert(fs.readdirSync(path.join(REPO, "pending")).some((f) => f.startsWith("20")), "pending 文件已创建");
+	// 4. pending：语义正确、忽略于 git、拒绝原因进入会话审计。
+	result = await remember({ title: "待审测试", description: "待审核候选测试", body: "待审正文。", tags: ["测试"], zone: "personal", layer: "principles", type: "Principle", as_pending: true });
+	assert(toolText(result).includes("待审核候选"), "可以创建待审核候选");
+	let pending = pendingFiles()[0];
+	const pendingPath = path.join(REPO, "pending", pending);
+	let pendingText = fs.readFileSync(pendingPath, "utf8");
+	assert(pendingText.includes("status: pending") && pendingText.includes("reviewed: false"), "pending 不冒充正式已审核记忆");
+	if (process.platform !== "win32") assert((fs.statSync(pendingPath).mode & 0o777) === 0o600, "pending 使用仅当前用户可读写的权限");
+	assert((await git(["status", "--porcelain"])).stdout.trim() === "", "pending 文件不会污染 git 状态");
 	await commands.memory.handler("review", ctx);
-	const pendingId = fs
-		.readdirSync(path.join(REPO, "pending"))
-		.find((f) => f.endsWith(".md") && f !== "README.md")
-		.replace(/\.md$/, "");
-	await commands.memory.handler(`reject ${pendingId}`, ctx);
-	assert(!fs.readdirSync(path.join(REPO, "pending")).some((f) => f !== "README.md"), "reject 后 pending 清空");
-	assert((await git(["status", "--porcelain"])).stdout.trim() === "", "reject 未产生 git 改动");
+	await commands.memory.handler(`reject ${pending.replace(/\.md$/, "")} 测试拒绝`, ctx);
+	assert(pendingFiles().length === 0, "拒绝后删除 pending");
+	assert(entries.some((entry) => entry.customType === "memark-rejection" && entry.data.reason === "测试拒绝"), "拒绝原因写入会话审计");
 
-	// ---- 3a. 同名文件守卫 ----
+	const noUiCtx = { hasUI: false, ui: { confirm: async () => false, notify: () => {} }, cwd: "/workspace/none" };
+	result = await remember({ title: "无界面候选", description: "验证无界面模式只写 pending", body: "无界面正文。", tags: ["测试"], zone: "personal", layer: "principles", type: "Principle" }, noUiCtx);
+	assert(toolText(result).includes("待审核候选") && pendingFiles().length === 1, "无界面模式不会正式提交");
+	fs.rmSync(path.join(REPO, "pending", pendingFiles()[0]));
+
+	const fakeSecret = "gh" + "p_" + "A".repeat(30);
 	try {
-		await tools.memark_remember.execute(
-			"t2a",
-			{ title: "能不动就不动", description: "重复文件名测试", body: "x", tags: ["测试"], zone: "personal", layer: "principles", type: "Principle" },
-			undefined, undefined, ctx,
-		);
-		assert(false, "同名文件应被守卫拦截");
-	} catch (e) {
-		assert(String(e.message).includes("已存在"), "同名文件守卫生效");
+		await remember({ title: "敏感候选", description: "应被拒绝", body: fakeSecret, tags: ["测试"], zone: "personal", layer: "principles", type: "Principle", as_pending: true });
+		assert(false, "含疑似密钥的 pending 应失败");
+	} catch (error) {
+		assert(String(error.message).includes("敏感信息"), "pending 写入前执行敏感信息检查");
 	}
 
-	// ---- 3b. 重复描述：仓库校验拦截并自清理 ----
-	r = await tools.memark_remember.execute(
-		"t2b",
-		{ title: "最小化改动原则", description: "不引入额外复杂度，最小化系统改动", body: "与既有条目重复，应被拦截。", tags: ["测试"], zone: "personal", layer: "principles", type: "Principle" },
-		undefined, undefined, ctx,
-	);
-	assert(r.content[0].text.startsWith("✗"), "重复描述被校验拦截");
-	assert((await git(["status", "--porcelain"])).stdout.trim() === "", "拦截后工作区恢复干净");
+	try {
+		await remember({ title: "能不动就不动", description: "重复文件", body: "x", tags: ["测试"], zone: "personal", layer: "principles", type: "Principle" });
+		assert(false, "同名正式记忆应失败");
+	} catch (error) {
+		assert(String(error.message).includes("已存在"), "同名文件守卫生效");
+	}
 
-	// ---- 4. 正式写入（confirm 自动同意） ----
-	const before = (await git(["rev-parse", "HEAD"])).stdout.trim();
-	r = await tools.memark_remember.execute(
-		"t3",
-		{ title: "P3 正式写入测试", description: "完整 curator 流程测试", body: "走完 pull→校验→确认→commit→push。", tags: ["测试"], zone: "project", project: "wiki", category: "topics", type: "Topic" },
-		undefined, undefined, ctx,
-	);
-	console.log(`  [tool] ${r.content[0].text}`);
-	assert(r.content[0].text.startsWith("✓"), "正式写入成功");
-	assert(fs.existsSync(path.join(REPO, "projects/wiki/topics/P3正式写入测试.md")), "目标文件存在");
-	const idxNow = fs.readFileSync(path.join(REPO, "INDEX.md"), "utf8");
-	const projIdx = fs.readFileSync(path.join(REPO, "projects/wiki/INDEX.md"), "utf8");
-	assert(projIdx.includes("P3 正式写入测试"), "项目 INDEX 已更新");
-	assert(!idxNow.includes("P3 正式写入测试"), "根 INDEX 不含项目区条目");
-	const subject = (await git(["log", "-1", "--pretty=%s"])).stdout.trim();
-	assert(subject === "memory: projects/wiki/topics/P3正式写入测试.md", "commit message 正确");
-	assert((await git(["status", "--porcelain"])).stdout.trim() === "", "提交后工作区干净");
+	// 5. 正式写入：确认前不触碰正式目录；只提交计划文件。
+	const formalRel = "projects/wiki/topics/正式写入测试.md";
+	let checkedBeforeConfirm = false;
+	confirmImpl = async (_title, preview) => {
+		checkedBeforeConfirm = !fs.existsSync(path.join(REPO, formalRel));
+		assert(preview.includes(formalRel) && preview.includes("+ status: active"), "确认窗口展示修改预览");
+		return true;
+	};
+	result = await remember({ title: "正式写入测试", description: "验证安全正式写入流程", body: "正式正文。", tags: ["测试"], zone: "project", project: "wiki", category: "topics", type: "Topic" });
+	confirmImpl = async () => true;
+	assert(checkedBeforeConfirm, "用户确认前正式目录没有草案");
+	assert(toolText(result).startsWith("✓"), "正式写入成功");
+	assert(fs.existsSync(path.join(REPO, formalRel)), "正式文件已创建");
+	assert(fs.readFileSync(path.join(REPO, "projects/wiki/INDEX.md"), "utf8").includes("正式写入测试"), "项目索引已更新");
+	let commitFiles = (await git(["show", "--name-only", "--format=", "HEAD"])).stdout;
+	assert(!commitFiles.includes("pending/"), "正式 commit 不包含 pending 文件");
+	assert((await git(["status", "--porcelain"])).stdout.trim() === "", "正式写入后工作区干净");
 
-	// ---- 5. forget 归档 ----
-	await commands.memory.handler("forget projects/wiki/topics/P3正式写入测试.md", ctx);
-	assert(!fs.existsSync(path.join(REPO, "projects/wiki/topics/P3正式写入测试.md")), "原位置文件已移除");
-	assert(fs.existsSync(path.join(REPO, "archive/P3正式写入测试.md")), "已移入 archive/");
-	assert((await git(["log", "-1", "--pretty=%s"])).stdout.trim() === "memory: archive projects/wiki/topics/P3正式写入测试.md", "归档 commit 正确");
+	result = await remember({ title: "新项目首条决策", description: "验证新项目自动建立路由", body: "新项目正文。", tags: ["测试"], zone: "project", project: "newproject", category: "decisions", type: "Decision" });
+	assert(toolText(result).startsWith("✓"), "可以写入尚未建立项目区的新项目");
+	assert(fs.existsSync(path.join(REPO, "projects/newproject/README.md")) && fs.existsSync(path.join(REPO, "projects/newproject/INDEX.md")), "新项目自动建立 README 和 INDEX");
 
-	// ---- 6. revert 两次回到基线（跳过已回滚提交） ----
-	await commands.memory.handler("revert", ctx); // 撤销归档
-	await commands.memory.handler("revert", ctx); // 撤销写入
-	const after = (await git(["rev-parse", "HEAD"])).stdout.trim();
-	const diff = await git(["diff", before, after]);
-	assert(diff.stdout.trim() === "", "两次 revert 后内容与基线一致");
-	assert((await git(["status", "--porcelain"])).stdout.trim() === "", "最终工作区干净");
+	// 6. approve：pending 不进入 commit，批准后仓库保持干净。
+	await remember({ title: "批准流程测试", description: "验证 pending approve", body: "批准正文。\ntarget: 正文中的普通文本", tags: ["测试"], zone: "personal", layer: "principles", type: "Principle", as_pending: true });
+	pending = pendingFiles()[0];
+	await commands.memory.handler(`approve ${pending.replace(/\.md$/, "")}`, ctx);
+	const approvedPath = path.join(REPO, "principles/批准流程测试.md");
+	assert(fs.existsSync(approvedPath), "approve 生成正式记忆");
+	assert(fs.readFileSync(approvedPath, "utf8").includes("target: 正文中的普通文本"), "approve 只移除 frontmatter 的 target，不误删正文");
+	assert(pendingFiles().length === 0, "approve 后删除本地 pending");
+	commitFiles = (await git(["show", "--name-only", "--format=", "HEAD"])).stdout;
+	assert(!commitFiles.includes("pending/"), "approve 的 commit 不包含 pending");
+	assert((await git(["status", "--porcelain"])).stdout.trim() === "", "approve 后工作区干净");
 
-	// ---- 7. push 验证（bare 仓库同步） ----
-	const bareHead = (await exec("git", ["-C", BARE, "rev-parse", "main"])).stdout.trim();
-	assert(bareHead === after, "已推送到远端（bare）");
+	// 7. supersedes 同 commit 更新旧状态。
+	result = await remember({ title: "最小改动原则新版", description: "取代旧版最小改动原则", body: "使用新版原则。", tags: ["测试"], zone: "personal", layer: "principles", type: "Principle", supersedes: "principles/能不动就不动.md" });
+	assert(toolText(result).startsWith("✓"), "supersedes 写入成功");
+	assert(fs.readFileSync(path.join(REPO, "principles/能不动就不动.md"), "utf8").includes("status: superseded"), "旧记忆标记为 superseded");
+	commitFiles = (await git(["show", "--name-only", "--format=", "HEAD"])).stdout;
+	assert(commitFiles.includes("最小改动原则新版.md") && commitFiles.includes("能不动就不动.md"), "新旧状态位于同一个 commit");
 
-	// ---- 8. /memory status ----
-	await commands.memory.handler("status", ctx);
+	const raceWriter = path.join(BASE, "remote-writer");
+	confirmImpl = async () => {
+		shell(`git -C "${raceWriter}" pull -q --ff-only`);
+		const raceFile = path.join(raceWriter, "preferences", "确认期间远端更新.md");
+		fs.writeFileSync(raceFile, `---\ntype: Preference\ntitle: 确认期间远端更新\ndescription: 验证确认期间远端变化会停止旧预览提交\nstatus: active\nprivacy: internal\ntags: [同步, 测试]\ntimestamp: 2026-09-22\nsource: user-confirmed\nreviewed: true\n---\n\n远端竞态测试。\n`);
+		shell(`python3 "${raceWriter}/scripts/generate_index.py" --root "${raceWriter}"`);
+		shell(`git -C "${raceWriter}" add -- preferences/确认期间远端更新.md INDEX.md`);
+		shell(`git -C "${raceWriter}" commit -q -m "memory: remote race fixture"`);
+		shell(`git -C "${raceWriter}" push -q`);
+		return true;
+	};
+	result = await remember({ title: "远端竞态保护测试", description: "远端变化时不使用旧预览提交", body: "应降级待审。", tags: ["测试"], zone: "personal", layer: "principles", type: "Principle" });
+	confirmImpl = async () => true;
+	assert(!fs.existsSync(path.join(REPO, "principles/远端竞态保护测试.md")), "确认期间远端变化时不写入旧草案");
+	assert(toolText(result).includes("候选保留") && pendingFiles().length === 1, "远端变化时降级保存 pending");
+	fs.rmSync(path.join(REPO, "pending", pendingFiles()[0]));
 
-	// ---- 9. sync：模拟绕过协议的手工编辑 → 自动重建索引 ----
-	const f = path.join(REPO, "principles/清理前先备份.md");
-	const orig = fs.readFileSync(f, "utf8");
-	fs.writeFileSync(f, orig.replace("删除数据前必须备份；批量操作先 dry-run 确认后执行", "删除前必须备份；批量/破坏性操作先 dry-run"));
-	await git(["add", "-A"]);
-	await git(["commit", "-m", "manual edit simulation"]);
-	await commands.memory.handler("sync", ctx);
-	assert(fs.readFileSync(path.join(REPO, "INDEX.md"), "utf8").includes("批量/破坏性操作先 dry-run"), "sync 重建了过期索引");
-	assert((await git(["status", "--porcelain"])).stdout.trim() === "", "sync 后工作区干净");
-	const bareHead2 = (await exec("git", ["-C", BARE, "rev-parse", "main"])).stdout.trim();
-	assert(bareHead2 === (await git(["rev-parse", "HEAD"])).stdout.trim(), "sync 已推送重建 commit");
-	// 还原模拟编辑（非记忆 commit，/memory revert 应拒绝跨它们回滚，用原生 git revert 还原）
-	const notes = [];
-	ctx.ui.notify = (m) => { notes.push(String(m)); console.log(`  [notify] ${String(m).split("\n")[0]}`); };
+	// 8. 仓库已有手工修改时停止，不删除修改，并把新请求降级为 pending。
+	const protectedFile = path.join(REPO, "principles/清理前先备份.md");
+	fs.appendFileSync(protectedFile, "\nUNCOMMITTED_SENTINEL\n");
+	result = await remember({ title: "脏仓库保护测试", description: "验证不会覆盖手工修改", body: "保护正文。", tags: ["测试"], zone: "personal", layer: "principles", type: "Principle" });
+	assert(fs.readFileSync(protectedFile, "utf8").includes("UNCOMMITTED_SENTINEL"), "失败流程保留用户未提交修改");
+	assert(toolText(result).includes("待审核候选"), "仓库有修改时自动降级为 pending");
+	shell(`git -C "${REPO}" checkout -- principles/清理前先备份.md`);
+	for (const file of pendingFiles()) fs.rmSync(path.join(REPO, "pending", file));
+	assert((await git(["status", "--porcelain"])).stdout.trim() === "", "清理测试状态后仓库干净");
+
+	// 9. 路径越界攻击不能删除外部文件。
+	const outside = path.join(BASE, "outside.md");
+	fs.writeFileSync(outside, "outside sentinel\n");
+	await commands.memory.handler("forget ../outside.md", ctx);
+	assert(fs.existsSync(outside), "forget 拒绝记忆库外路径");
+	const malicious = path.join(REPO, "pending", "malicious.md");
+	fs.writeFileSync(malicious, `---\ntarget: ../outside.md\ntitle: malicious\n---\nbody\n`);
+	await commands.memory.handler("approve malicious", ctx);
+	assert(fs.existsSync(outside) && !fs.existsSync(path.join(BASE, "outside.md.md")), "approve 拒绝恶意 target 路径");
+	fs.rmSync(malicious);
+
+	// 10. 正常归档保留原目录结构，随后安全撤销。
+	await commands.memory.handler(`forget ${formalRel}`, ctx);
+	assert(!fs.existsSync(path.join(REPO, formalRel)), "归档后原文件移除");
+	assert(fs.existsSync(path.join(REPO, "archive", formalRel)), "archive 保留原相对目录，避免同名冲突");
 	await commands.memory.handler("revert", ctx);
-	assert(notes[notes.length - 1].includes("拒绝回滚"), "revert 正确拒绝跨非记忆提交");
-	const choreHash = (await git(["rev-parse", "HEAD"])).stdout.trim();
-	const manualHash = (await git(["rev-parse", "HEAD~1"])).stdout.trim();
-	await git(["revert", "--no-edit", manualHash]); // manual edit simulation
-	await git(["revert", "--no-edit", choreHash]); // chore: rebuild index
-	await git(["push"]);
-	const diff2 = await git(["diff", before, "HEAD"]);
-	assert(diff2.stdout.trim() === "", "全部回滚后与基线一致");
+	assert(fs.existsSync(path.join(REPO, formalRel)), "revert 恢复最近一次归档");
+	assert(!fs.existsSync(path.join(REPO, "archive", formalRel)), "revert 清除对应归档副本");
 
-	// ---- 10. session_start 自动同步（静默 pull，不 push） ----
-	assert(typeof handlers.session_start === "function", "session_start handler 已注册");
-	await handlers.session_start(); // 不应抛错（离线/分叉均静默）
-	assert((await git(["status", "--porcelain"])).stdout.trim() === "", "session_start 同步后工作区干净");
+	// 11. commit hook 失败时只恢复本次文件，不留暂存内容。
+	const failingHooks = path.join(BASE, "failing-hooks");
+	fs.mkdirSync(failingHooks);
+	fs.writeFileSync(path.join(failingHooks, "pre-commit"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+	await git(["config", "core.hooksPath", failingHooks]);
+	result = await remember({ title: "提交失败回滚测试", description: "验证精确回滚", body: "不会残留。", tags: ["测试"], zone: "personal", layer: "principles", type: "Principle" });
+	await git(["config", "core.hooksPath", ".githooks"]);
+	assert(toolText(result).startsWith("✗"), "commit 失败被报告");
+	assert(!fs.existsSync(path.join(REPO, "principles/提交失败回滚测试.md")), "commit 失败后移除本次新文件");
+	assert((await git(["status", "--porcelain"])).stdout.trim() === "", "commit 失败后工作区和暂存区干净");
 
-	console.log("\n全部 P3 测试通过");
-})().catch((e) => {
-	console.error("HARNESS ERROR:", e);
+	// 12. 同时发起的两次写入会排队，不互相覆盖。
+	const [parallelA, parallelB] = await Promise.all([
+		remember({ title: "串行写入甲", description: "并发测试甲", body: "甲。", tags: ["测试"], zone: "personal", layer: "principles", type: "Principle" }),
+		remember({ title: "串行写入乙", description: "并发测试乙", body: "乙。", tags: ["测试"], zone: "personal", layer: "principles", type: "Principle" }),
+	]);
+	assert(toolText(parallelA).startsWith("✓") && toolText(parallelB).startsWith("✓"), "并发写入按顺序完成");
+	assert((await git(["status", "--porcelain"])).stdout.trim() === "", "并发写入后仓库干净");
+
+	// 13. sync：远端手工改正文但漏更索引时，只修复索引，不夹带其他文件。
+	const remoteWriter = path.join(BASE, "remote-writer");
+	shell(`git -C "${remoteWriter}" pull -q --ff-only`);
+	shell(`git -C "${remoteWriter}" config core.hooksPath /dev/null`);
+	const remoteFile = path.join(remoteWriter, "principles", "清理前先备份.md");
+	fs.writeFileSync(remoteFile, fs.readFileSync(remoteFile, "utf8").replace("删除数据前必须备份；批量操作先 dry-run 确认后执行", "删除前必须备份；破坏性操作先预览"));
+	shell(`git -C "${remoteWriter}" add -- principles/清理前先备份.md`);
+	shell(`git -C "${remoteWriter}" commit -q -m "manual edit simulation"`);
+	shell(`git -C "${remoteWriter}" push -q`);
+	await commands.memory.handler("sync", ctx);
+	assert(fs.readFileSync(path.join(REPO, "INDEX.md"), "utf8").includes("破坏性操作先预览"), "sync 修复远端遗漏的索引更新");
+	commitFiles = (await git(["show", "--name-only", "--format=", "HEAD"])).stdout.trim();
+	assert(commitFiles === "INDEX.md", "sync 修复 commit 只包含索引");
+	assert((await git(["status", "--porcelain"])).stdout.trim() === "", "sync 后仓库干净");
+
+	// 14. maintain 与 status 可执行，fixture 完全独立于私人 memory 仓库。
+	await commands.memory.handler("maintain", ctx);
+	await commands.memory.handler("status", ctx);
+	assert(notes.some((note) => note.includes("维护检查通过")), "maintain 完成只读检查");
+	const bareHead = shell(`git -C "${BARE}" rev-parse main`).trim();
+	const localHead = (await git(["rev-parse", "HEAD"])).stdout.trim();
+	assert(bareHead === localHead, "全部成功提交均已推送到隔离远端");
+
+	console.log("\n全部 memark 回归测试通过");
+})().catch((error) => {
+	console.error("HARNESS ERROR:", error);
 	process.exit(1);
 });

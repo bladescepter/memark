@@ -9,50 +9,92 @@
 
 | 仓库 | 内容 |
 |---|---|
-| `memark`（本仓库） | 扩展代码：recall 工具、curator 流程、/memory 命令、Jev 门卫 |
-| `memory`（独立私有仓库） | 记忆数据：五层目录、README 路由协议、INDEX.md、校验脚本 |
+| `memark`（本仓库） | 扩展代码：记忆查找、受控写入、`/memory` 命令；未来接入候选门卫 |
+| `memory`（独立私有仓库） | 记忆数据、路由协议、索引与校验脚本 |
 
 ## 安装
 
-**Linux/macOS/VPS（开发推荐）**：clone 后 symlink，改代码即生效（重启 pi 或 `/reload`）：
+各机器先分别克隆扩展和私有记忆仓库：
 
 ```bash
 git clone git@github.com:bladescepter/memark.git ~/DEV/memark
+git clone git@github.com:bladescepter/memory.git ~/DEV/memory
+```
+
+**Linux/macOS/VPS（开发推荐）**：
+
+```bash
 mkdir -p ~/.pi/agent/extensions
 ln -s ~/DEV/memark ~/.pi/agent/extensions/memark
 ```
 
-**Windows**：clone 后在 `~/.pi/agent/settings.json` 中指向（无需管理员权限）：
+**Windows**：在 `~/.pi/agent/settings.json` 中指向本地目录：
 
 ```json
 { "extensions": ["C:/Users/blade/DEV/memark"] }
 ```
 
-**任意机器（包安装）**：仓库公开，`pi install git:github.com/bladescepter/memark`，升级用 `pi update memark`。
+**作为 pi 包安装**：
 
-记忆仓库路径由环境变量 `MEMARK_REPO` 指定，默认 `~/DEV/memory`（各机需先 clone）；项目区按当前目录名匹配 `projects/<项目名>/`，可用 `MEMARK_PROJECT` 显式指定。
+```bash
+pi install git:github.com/bladescepter/memark
+pi update --extensions
+```
 
-## 功能
+安装或更新后，在已有会话中执行 `/reload`。记忆仓库路径由 `MEMARK_REPO` 指定，默认 `~/DEV/memory`；项目名默认从当前目录及其父目录中匹配，也可用 `MEMARK_PROJECT` 指定。
 
-### v0.3（当前）
+## 当前功能（v0.3.1）
 
-- `memark_recall` 工具：相关性排序检索（标题>描述>tags 加权），默认范围 = 个人区 + 当前项目区
-- `memark_remember` 工具（curator，P3）：草案 → 仓库校验（schema/secret/去重/索引）→ 展示草案请用户确认 → 一条一 commit 并推送；无 UI 模式自动降级为只写 `pending/`
-- `/memory` 命令族：`status`（默认）/ `sync`（pull --ff-only + 索引一致性修复 + push）/ `review` / `approve <id>` / `reject <id>` / `forget <path>`（归档）/ `revert`（回滚最近一次未回滚的记忆写入，遇非记忆提交即停止）
-- `supersedes` 取代流程：新条目写入同时原条目标记 `superseded`，同 commit
-- 会话启动自动同步：`session_start` 后台静默 `pull --ff-only`（不 push、失败静默跳过），保障 recall 新鲜度；完整同步仍用 `/memory sync`
-- 回归测试：`sh tests/run.sh`（隔离 git 环境全流程测试）
+### 查找记忆
 
-### 历史
+- `memark_recall` 默认查找个人区和当前项目区。
+- 每个会话第一次真正查找记忆时，先尝试在 5 秒内下载远端最新版本；不再在会话启动时联网。
+- 同一会话后续查找不重复下载；失败时使用本地快照并明确提示。
+- `all_projects=true` 可显式跨项目查找。
+- 先查标题、描述和标签，再以正文关键词补充；过期记忆不返回。
+- 输出总量限制为 50KB/2000 行。
 
-- v0.2：单仓双区协议 + recall 项目区支持
-- v0.1：recall 工具 + `/memory` 状态
+### 受控写入
 
-### 计划
+`memark_remember` 只在用户明确要求“记住”时使用：
 
-- v0.4 Gate：`agent_settled` → 本地硬规则 + secret scan → Jev 结构化判断（durable / user_grounded / ephemeral / sensitive）→ pending 候选区
-- 基线注入：`before_agent_start` 注入 ≤600 tokens 稳定基线
+1. 下载远端最新版本并确认仓库没有未处理修改；
+2. 在临时副本中生成草案、索引并运行格式、重复、链接和敏感信息检查；
+3. 展示修改前后预览；
+4. 用户确认后才写入正式目录；
+5. 只提交本次计划内文件，然后上传。
+
+无 UI、离线或仓库有未处理修改时，候选只保存在本机 `pending/`，不会进入 Git。写入按顺序执行，并使用本机仓库锁防止多个 pi 进程互相覆盖。
+
+### `/memory` 命令
+
+```text
+/memory status                    状态、数量和本地/远端差异
+/memory sync                      完整同步；必要时只修复索引
+/memory review                    查看待审核候选
+/memory approve <id>              预览并批准候选
+/memory reject <id> [原因]        拒绝候选；原因记入当前会话审计
+/memory maintain                  只读校验并列出过期记忆
+/memory forget <path>             按原目录结构移入 archive/
+/memory revert                    安全撤销最近一次记忆修改
+```
+
+所有文件路径都限制在记忆仓库内；失败时只恢复本次操作涉及的文件，不会清除用户的其他未提交修改。
+
+## 测试
+
+```bash
+npm test
+```
+
+测试先执行严格的 TypeScript 类型检查，再使用 `tests/fixtures/memory/` 中完全虚构的独立记忆库；不读取私人 `~/DEV/memory`。覆盖首次查找同步、项目隔离、待审核批准/拒绝、敏感信息、路径越界、失败恢复、并发写入、远端竞态、归档、撤销和索引修复。GitHub 在每次推送和合并请求时自动运行同一套测试。
+
+## 后续计划
+
+- 建立 200–500 轮人工标注集后，再接入 Jev 候选门卫；它只能写入 `pending/`。
+- 增加不超过 600 tokens 的稳定基础记忆注入。
+- 三台机器分别完成一次真实同步验证后，再结束 P3 验收。
 
 ## 降级
 
-仓库本身是纯 Markdown：扩展不可用时，在全局指令中保留一行说明（记忆位于 `~/DEV/memory`，按其 `README.md` 协议用 `read`/`grep` 直接读取）即可。
+扩展不可用时，记忆仓库仍是普通 Markdown：按其 `README.md` 协议使用 `read`/`grep` 读取，手工运行校验脚本后提交即可。
