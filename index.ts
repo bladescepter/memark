@@ -1,48 +1,26 @@
 /**
- * memark — memory + markdown
- * pi 编码代理的长期记忆扩展。
+ * memark — memory + markdown，pi 编码代理的长期记忆扩展。
  *
- * v0.1（当前）
- *   - memark_recall 工具：按任务检索记忆仓库（INDEX.md 路由 → 读取正文）
- *   - /memory 命令：仓库状态（索引条目、分层计数、pending、git 状态）
+ * v0.3（当前）
+ *   - memark_recall 工具：相关性排序检索（标题>描述>tags 加权），默认范围=个人区+当前项目区
+ *   - memark_remember 工具（curator）：草案→仓库校验→用户确认→一条一 commit→push；无 UI 降级只写 pending
+ *   - /memory 命令族：status / review / approve / reject / forget / revert
  *
- * v0.2+（计划，见 docs/记忆系统重构完整方案.md §7–8）
+ * v0.4+（计划，见 docs/记忆系统重构完整方案.md §7）
  *   - Gate：agent_settled → 本地硬规则 + secret scan → Jev 结构化判断 → pending 入队
- *   - curator：候选提炼、去重、diff、用户批准（ctx.ui.confirm）后提交 Git
  *   - 基线注入：before_agent_start 注入 ≤600 tokens 稳定基线
  *
  * 记忆仓库路径：环境变量 MEMARK_REPO，默认 ~/DEV/memory。
- * 仓库协议（README 路由权威、五层目录、frontmatter）由记忆仓库自身承载。
+ * 仓库协议（README 路由权威、单仓双区、frontmatter）由记忆仓库自身承载与校验。
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join, resolve, basename } from "node:path";
-import { homedir } from "node:os";
+import { PROJECTS_DIR, REPO, readIndex } from "./repo";
+import { handleMemoryCommand, listPendingIds, registerCurator } from "./curator";
 
-const REPO = resolve(process.env.MEMARK_REPO ?? join(homedir(), "DEV", "memory"));
-const LAYERS = ["identity", "principles", "preferences", "context", "knowledge"] as const;
-const PROJECTS_DIR = "projects";
 const MAX_FILE_CHARS = 4000;
-
-/** 递归统计目录下 .md 文件数 */
-function countMd(dir: string): number {
-	if (!existsSync(dir)) return 0;
-	let n = 0;
-	for (const e of readdirSync(dir, { withFileTypes: true })) {
-		const p = join(dir, e.name);
-		if (e.isDirectory()) n += countMd(p);
-		else if (e.name.endsWith(".md") && e.name !== "README.md" && e.name !== "INDEX.md") n += 1;
-	}
-	return n;
-}
-
-/** 读取 INDEX.md 全部行（默认根索引；传入 dir 可读项目区索引）；不存在时返回空数组 */
-function readIndex(dir: string = REPO): string[] {
-	const p = join(dir, "INDEX.md");
-	if (!existsSync(p)) return [];
-	return readFileSync(p, "utf8").split("\n");
-}
 
 /** 当前项目对应的记忆目录（projects/<项目名>）；无项目索引时返回 null */
 function projectDirFor(cwd?: string): string | null {
@@ -54,7 +32,7 @@ function projectDirFor(cwd?: string): string | null {
 	return existsSync(join(dir, "INDEX.md")) ? dir : null;
 }
 
-/** 从 INDEX 条目行解析记忆文件相对路径（行尾最后一个 “ — ” 之后、以 .md 结尾的部分） */
+/** 从 INDEX 条目行解析记忆文件相对路径（行尾最后一个 " — " 之后、以 .md 结尾的部分） */
 function pathFromIndexLine(line: string): string | null {
 	const m = line.match(/—\s*(\S+\.md)\s*$/);
 	return m ? m[1] : null;
@@ -91,9 +69,9 @@ export function matchIndexLines(lines: string[], query: string): string[] {
 		const anyHit =
 			tokens.some((t) => low.includes(t)) || (tokens.length > 1 && low.includes(lowerQuery));
 		if (!anyHit) continue;
-		const parsed = parseIndexLine(line);
 		const rel = pathFromIndexLine(line);
 		if (!rel) continue;
+		const parsed = parseIndexLine(line);
 		let score = 1;
 		let tokenHits = 0;
 		if (parsed) {
@@ -189,46 +167,41 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// ---------- /memory 命令 ----------
+	// ---------- curator（P3） ----------
+	registerCurator(pi);
+
+	// ---------- /memory 命令族 ----------
 	pi.registerCommand("memory", {
-		description: "memark 记忆库状态（/memory 或 /memory status）",
-		handler: async (_args, ctx) => {
-			if (!existsSync(REPO)) {
-				ctx.ui.notify(
-					`memark：记忆仓库不存在（${REPO}）。设置 MEMARK_REPO 环境变量，或按协议创建 memory 仓库。`,
-					"warning",
-				);
-				return;
+		description: "memark 记忆库：status（默认）/ review / approve <id> / reject <id> / forget <path> / revert",
+		getArgumentCompletions: (prefix: string) => {
+			const items: { value: string; label: string }[] = [];
+			const parts = prefix.split(/\s+/);
+			if (parts.length <= 1) {
+				for (const c of ["status", "review", "approve", "reject", "forget", "revert"]) {
+					if (c.startsWith(prefix)) items.push({ value: c, label: c });
+				}
+			} else if (parts[0] === "approve" || parts[0] === "reject") {
+				for (const id of listPendingIds()) {
+					if (id.startsWith(parts[1] ?? "")) items.push({ value: `${parts[0]} ${id}`, label: id });
+				}
+			} else if (parts[0] === "forget") {
+				for (const line of readIndex()) {
+					const rel = pathFromIndexLine(line);
+					if (rel && rel.startsWith(parts[1] ?? "")) items.push({ value: `forget ${rel}`, label: rel });
+				}
 			}
-			const entries = readIndex().filter((l) => l.includes(".md")).length;
-			const pending = countMd(join(REPO, "pending"));
-			const counts = LAYERS.map((l) => `${l}: ${countMd(join(REPO, l))}`).join("  ");
-
-			let projectInfo = "无";
-			const projectsRoot = join(REPO, PROJECTS_DIR);
-			if (existsSync(projectsRoot)) {
-				const names = readdirSync(projectsRoot, { withFileTypes: true })
-					.filter((e) => e.isDirectory())
-					.map((e) => e.name)
-					.sort();
-				if (names.length > 0)
-					projectInfo = names.map((n) => `${n}: ${countMd(join(projectsRoot, n))}`).join("  ");
+			return items.length > 0 ? items : null;
+		},
+		handler: async (args, ctx) => {
+			try {
+				await handleMemoryCommand(pi, args ?? "", ctx as never);
+			} catch (err) {
+				ctx.ui.notify(`memark：操作失败：${(err as Error).message}`, "error");
 			}
-
-			const { stdout: st, code } = await pi.exec("git", ["-C", REPO, "status", "--porcelain"]);
-			const dirty = code === 0 ? st.split("\n").filter(Boolean).length : -1;
-			const { stdout: br } = await pi.exec("git", ["-C", REPO, "branch", "--show-current"]);
-			const gitInfo =
-				dirty === -1 ? "非 git 仓库" : `${br.trim() || "?"}${dirty > 0 ? `（${dirty} 处未提交）` : "（干净）"}`;
-
-			ctx.ui.notify(
-				`memark @ ${REPO}\n个人区索引条目: ${entries}  pending: ${pending}  git: ${gitInfo}\n${counts}\n项目区: ${projectInfo}`,
-				"info",
-			);
 		},
 	});
 
-	// ---------- Gate（v0.2，未启用） ----------
+	// ---------- Gate（v0.4，未启用） ----------
 	// agent_settled → 本地硬规则（工具输出/密钥/一次性内容直接丢弃）
 	// → secret scan → Jev 并行判断（durable / user_grounded / ephemeral / sensitive…）
 	// → pending 候选区。设计见 docs/记忆系统重构完整方案.md §7。

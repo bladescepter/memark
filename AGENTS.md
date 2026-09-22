@@ -20,6 +20,7 @@ memark = **mem**ory + **m**arkdown，pi 编码代理的长期记忆扩展。
 ## 当前状态（截至 2026-09-21）
 
 - v0.1（commit `2a6b46b`）：`memark_recall` 工具（INDEX.md 路由 → 读取正文，含路径逃逸防护与截断）+ `/memory` 命令（分层计数、pending、git 状态）；Gate（v0.2）在 index.ts 中留有明确未启用注记
+- 2026-09-22 P3 完成并发布 v0.3.0：多文件重构（repo.ts / curator.ts / index.ts）；`memark_remember` curator 工具（草案→仓库校验→ctx.ui.confirm→一条一 commit→push，无 UI 降级只写 pending）；`/memory` 命令族（status/review/approve/reject/forget/revert，revert 会跳过已回滚的记忆提交）；supersedes 取代流程；回归测试 `sh tests/run.sh`（隔离 git 环境全流程）全部通过
 - memory 私有仓库已创建并推送：`git@github.com:bladescepter/memory.git`，本地路径 `~/DEV/memory`，初始协议 commit `1ad6d0d`
 - P1 已完成：五层目录、根/分层 README 路由、frontmatter 规范、INDEX 生成、schema/secret/重复/链接校验、pre-commit hook 和单元测试均已建立；尚无正式记忆
 - 2026-09-21 协议升级为单仓双区：个人区（五层，跨项目有效）+ 项目区 `projects/<项目名>/`（decisions/topics/incidents/handoffs，单项目有效，scope: project）；方案 §4.2 已同步改写；memory 仓库 commit `c17946e`，memark recall 已支持项目区索引
@@ -30,9 +31,9 @@ memark = **mem**ory + **m**arkdown，pi 编码代理的长期记忆扩展。
 
 ## 下一步
 
-1. 用首批已批准记忆验证 `memark_recall` 的真实检索流程（`/reload` 后在不同项目目录下测试个人区+项目区召回）
-2. P3：完善 memark 扩展（curator 候选审核、diff、批准、拒绝、归档、回滚）
-3. 日常使用中积累新记忆，验证准入与去重流程
+1. 日常使用：用户说「记住 XX」→ agent 调 `memark_remember` → 确认入库；定期观察漏召回/误报，积累评测集
+2. P4：接入 Jev Gate（先离线跑标注集校准，再接 `agent_settled`，只写 pending）
+3. 基线注入：`before_agent_start` 注入 ≤600 tokens 稳定基线
 
 ## 本项目纪律
 

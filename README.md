@@ -14,31 +14,42 @@
 
 ## 安装
 
+**Linux/macOS/VPS（开发推荐）**：clone 后 symlink，改代码即生效（重启 pi 或 `/reload`）：
+
 ```bash
 git clone git@github.com:bladescepter/memark.git ~/DEV/memark
 mkdir -p ~/.pi/agent/extensions
 ln -s ~/DEV/memark ~/.pi/agent/extensions/memark
 ```
 
-或在 `~/.pi/agent/settings.json` 中：
+**Windows**：clone 后在 `~/.pi/agent/settings.json` 中指向（无需管理员权限）：
 
 ```json
-{ "extensions": ["~/DEV/memark"] }
+{ "extensions": ["C:/Users/blade/DEV/memark"] }
 ```
 
-记忆仓库路径由环境变量 `MEMARK_REPO` 指定，默认 `~/DEV/memory`。
+**任意机器（包安装）**：仓库公开，`pi install git:github.com/bladescepter/memark`，升级用 `pi update memark`。
+
+记忆仓库路径由环境变量 `MEMARK_REPO` 指定，默认 `~/DEV/memory`（各机需先 clone）；项目区按当前目录名匹配 `projects/<项目名>/`，可用 `MEMARK_PROJECT` 显式指定。
 
 ## 功能
 
-### v0.1（当前）
+### v0.3（当前）
 
-- `memark_recall` 工具：按任务检索记忆仓库，默认范围 = 个人区 INDEX + 当前项目 `projects/<项目名>/INDEX.md`；经索引路由后返回相关记忆正文；仓库未初始化时明确报告并放行，不阻塞任务
-- `/memory` 命令：仓库状态（个人区索引条目、五层计数、项目区各项目计数、pending、git 状态）
+- `memark_recall` 工具：相关性排序检索（标题>描述>tags 加权），默认范围 = 个人区 + 当前项目区
+- `memark_remember` 工具（curator，P3）：草案 → 仓库校验（schema/secret/去重/索引）→ 展示草案请用户确认 → 一条一 commit 并推送；无 UI 模式自动降级为只写 `pending/`
+- `/memory` 命令族：`status`（默认）/ `review` / `approve <id>` / `reject <id>` / `forget <path>`（归档）/ `revert`（回滚最近一次未回滚的记忆写入）
+- `supersedes` 取代流程：新条目写入同时原条目标记 `superseded`，同 commit
+- 回归测试：`sh tests/run.sh`（隔离 git 环境全流程测试）
+
+### 历史
+
+- v0.2：单仓双区协议 + recall 项目区支持
+- v0.1：recall 工具 + `/memory` 状态
 
 ### 计划
 
-- v0.2 Gate：`agent_settled` → 本地硬规则 + secret scan → Jev 结构化判断（durable / user_grounded / ephemeral / sensitive）→ pending 候选区
-- v0.3 curator：候选提炼、去重、diff、用户批准（`ctx.ui.confirm`）后提交 Git
+- v0.4 Gate：`agent_settled` → 本地硬规则 + secret scan → Jev 结构化判断（durable / user_grounded / ephemeral / sensitive）→ pending 候选区
 - 基线注入：`before_agent_start` 注入 ≤600 tokens 稳定基线
 
 ## 降级
