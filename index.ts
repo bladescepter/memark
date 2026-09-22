@@ -172,12 +172,12 @@ export default function (pi: ExtensionAPI) {
 
 	// ---------- /memory 命令族 ----------
 	pi.registerCommand("memory", {
-		description: "memark 记忆库：status（默认）/ review / approve <id> / reject <id> / forget <path> / revert",
+		description: "memark 记忆库：status（默认）/ sync / review / approve <id> / reject <id> / forget <path> / revert",
 		getArgumentCompletions: (prefix: string) => {
 			const items: { value: string; label: string }[] = [];
 			const parts = prefix.split(/\s+/);
 			if (parts.length <= 1) {
-				for (const c of ["status", "review", "approve", "reject", "forget", "revert"]) {
+				for (const c of ["status", "sync", "review", "approve", "reject", "forget", "revert"]) {
 					if (c.startsWith(prefix)) items.push({ value: c, label: c });
 				}
 			} else if (parts[0] === "approve" || parts[0] === "reject") {

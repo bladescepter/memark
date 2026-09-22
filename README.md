@@ -38,7 +38,7 @@ ln -s ~/DEV/memark ~/.pi/agent/extensions/memark
 
 - `memark_recall` 工具：相关性排序检索（标题>描述>tags 加权），默认范围 = 个人区 + 当前项目区
 - `memark_remember` 工具（curator，P3）：草案 → 仓库校验（schema/secret/去重/索引）→ 展示草案请用户确认 → 一条一 commit 并推送；无 UI 模式自动降级为只写 `pending/`
-- `/memory` 命令族：`status`（默认）/ `review` / `approve <id>` / `reject <id>` / `forget <path>`（归档）/ `revert`（回滚最近一次未回滚的记忆写入）
+- `/memory` 命令族：`status`（默认）/ `sync`（pull --ff-only + 索引一致性修复 + push）/ `review` / `approve <id>` / `reject <id>` / `forget <path>`（归档）/ `revert`（回滚最近一次未回滚的记忆写入，遇非记忆提交即停止）
 - `supersedes` 取代流程：新条目写入同时原条目标记 `superseded`，同 commit
 - 回归测试：`sh tests/run.sh`（隔离 git 环境全流程测试）
 

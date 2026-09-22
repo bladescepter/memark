@@ -437,11 +437,44 @@ export async function handleMemoryCommand(pi: ExtensionAPI, args: string, ctx: C
 		return;
 	}
 
+	if (cmd === "sync") {
+		// 同步远端：pull --ff-only → 索引一致性修复（手工编辑过正文时）→ push 待推 commit
+		const pull = await git(pi, ["pull", "--ff-only"]);
+		if (pull.code !== 0) {
+			notify(
+				`git pull --ff-only 失败（本地与远端分叉或工作区有未提交冲突），已停止自动同步，请人工处理：\n${pull.stderr.trim()}`,
+				"error",
+			);
+			return;
+		}
+		const updated = pull.stdout.trim();
+		const chk = await runRepoScript(pi, "generate_index.py", ["--check"]);
+		if (chk.code !== 0) {
+			// 远端手工改过 title/description/tags 导致索引过期：重建并提交
+			await runRepoScript(pi, "generate_index.py");
+			const val = await runRepoScript(pi, "validate.py");
+			if (val.code !== 0) {
+				notify(`索引重建后校验仍不通过，请人工检查：\n${(val.stderr || val.stdout).trim()}`, "error");
+				return;
+			}
+			await git(pi, ["add", "-A"]);
+			await git(pi, ["commit", "-m", "chore: rebuild index after sync"]);
+		}
+		const p = await git(pi, ["push"]);
+		const head = (await git(pi, ["rev-parse", "--short", "HEAD"])).stdout.trim();
+		const parts = [`已同步到 ${head}`];
+		parts.push(updated.includes("Already up to date") || updated === "" ? "（本地已是最新）" : `\n拉取：\n${updated.split("\n").slice(0, 5).join("\n")}`);
+		parts.push(p.code === 0 ? "，已推送" : `，push 失败：${p.stderr.trim().split("\n")[0]}`);
+		notify(parts.join(""), p.code === 0 ? "info" : "warning");
+		return;
+	}
+
 	if (cmd === "revert") {
-		// 找最近一次尚未被回滚的记忆写入（跳过 Revert 提交本身）
+		// 回滚最近一次尚未被回滚的记忆写入；遇到无关提交即停止（不允许跨非记忆提交回滚更早的写入）
 		const { stdout: log } = await git(pi, ["log", "-30", "--pretty=%h %s"]);
 		const reverted = new Set<string>();
 		let target: { hash: string; subject: string } | null = null;
+		let blocked: string | null = null;
 		for (const line of log.split("\n")) {
 			const m = line.match(/^([0-9a-f]+) (.+)$/);
 			if (!m) continue;
@@ -451,13 +484,23 @@ export async function handleMemoryCommand(pi: ExtensionAPI, args: string, ctx: C
 				reverted.add(rv[1]);
 				continue;
 			}
-			if (subject.startsWith("memory:") && !reverted.has(subject)) {
+			if (!subject.startsWith("memory:")) {
+				blocked = subject;
+				break;
+			}
+			if (!reverted.has(subject)) {
 				target = { hash: m[1], subject };
 				break;
 			}
+			// 已被回滚的记忆写入 → 继续向前找更早的
 		}
 		if (!target) {
-			notify("最近 30 条 commit 中没有未回滚的记忆写入。", "warning");
+			notify(
+				blocked
+					? `最近的提交不是记忆写入（${blocked}），拒绝回滚；请用 git revert 手动处理。`
+					: "最近 30 条 commit 中没有未回滚的记忆写入。",
+				"warning",
+			);
 			return;
 		}
 		const ok = ctx.hasUI

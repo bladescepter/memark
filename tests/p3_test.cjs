@@ -152,6 +152,30 @@ const assert = (cond, msg) => {
 	// ---- 8. /memory status ----
 	await commands.memory.handler("status", ctx);
 
+	// ---- 9. sync：模拟绕过协议的手工编辑 → 自动重建索引 ----
+	const f = path.join(REPO, "principles/清理前先备份.md");
+	const orig = fs.readFileSync(f, "utf8");
+	fs.writeFileSync(f, orig.replace("删除数据前必须备份；批量操作先 dry-run 确认后执行", "删除前必须备份；批量/破坏性操作先 dry-run"));
+	await git(["add", "-A"]);
+	await git(["commit", "-m", "manual edit simulation"]);
+	await commands.memory.handler("sync", ctx);
+	assert(fs.readFileSync(path.join(REPO, "INDEX.md"), "utf8").includes("批量/破坏性操作先 dry-run"), "sync 重建了过期索引");
+	assert((await git(["status", "--porcelain"])).stdout.trim() === "", "sync 后工作区干净");
+	const bareHead2 = (await exec("git", ["-C", BARE, "rev-parse", "main"])).stdout.trim();
+	assert(bareHead2 === (await git(["rev-parse", "HEAD"])).stdout.trim(), "sync 已推送重建 commit");
+	// 还原模拟编辑（非记忆 commit，/memory revert 应拒绝跨它们回滚，用原生 git revert 还原）
+	const notes = [];
+	ctx.ui.notify = (m) => { notes.push(String(m)); console.log(`  [notify] ${String(m).split("\n")[0]}`); };
+	await commands.memory.handler("revert", ctx);
+	assert(notes[notes.length - 1].includes("拒绝回滚"), "revert 正确拒绝跨非记忆提交");
+	const choreHash = (await git(["rev-parse", "HEAD"])).stdout.trim();
+	const manualHash = (await git(["rev-parse", "HEAD~1"])).stdout.trim();
+	await git(["revert", "--no-edit", manualHash]); // manual edit simulation
+	await git(["revert", "--no-edit", choreHash]); // chore: rebuild index
+	await git(["push"]);
+	const diff2 = await git(["diff", before, "HEAD"]);
+	assert(diff2.stdout.trim() === "", "全部回滚后与基线一致");
+
 	console.log("\n全部 P3 测试通过");
 })().catch((e) => {
 	console.error("HARNESS ERROR:", e);
