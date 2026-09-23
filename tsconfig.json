@@ -10,5 +10,5 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["index.ts", "curator.ts", "repo.ts"]
+  "include": ["index.ts", "curator.ts", "repo.ts", "baseline.ts", "host-role.ts"]
 }

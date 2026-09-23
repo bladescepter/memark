@@ -23,6 +23,8 @@
   },
   "files": [
     "index.ts",
+    "baseline.ts",
+    "host-role.ts",
     "repo.ts",
     "curator.ts",
     "README.md",

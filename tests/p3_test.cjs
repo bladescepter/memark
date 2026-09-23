@@ -17,6 +17,7 @@ const jiti = createJiti(__filename, {
 });
 const mod = jiti(path.join(__dirname, "..", "index.ts"));
 const repoMod = jiti(path.join(__dirname, "..", "repo.ts"));
+const baselineMod = jiti(path.join(__dirname, "..", "baseline.ts"));
 
 const REPO = process.env.MEMARK_REPO;
 const BARE = process.env.TEST_REMOTE;
@@ -52,11 +53,14 @@ const pi = {
 mod.default(pi);
 
 let confirmImpl = async () => true;
+let inputImpl = async () => "VPS";
+let inputCount = 0;
 const notes = [];
 const ctx = {
 	hasUI: true,
 	ui: {
 		confirm: async (title, message) => confirmImpl(title, message),
+		input: async (title, placeholder) => { inputCount++; return inputImpl(title, placeholder); },
 		notify: (message) => {
 			notes.push(String(message));
 			console.log(`  [notify] ${String(message).split("\n")[0]}`);
@@ -103,6 +107,101 @@ function addRemoteMemory() {
 	escaped = false;
 	try { repoMod.resolveRepoPath("C:\\Windows\\outside.md"); } catch { escaped = true; }
 	assert(escaped, "在非 Windows 环境也能识别并拒绝 Windows 绝对路径");
+
+	// 1b. 基线：每轮本机环境 + 本地已审核个人记忆；不做远端请求或写入。
+	assert(typeof handlers.before_agent_start === "function", "每轮主机与基线注入已注册");
+	const promptEvent = { systemPrompt: "原始系统提示" };
+	const promptCtx = { cwd: "/workspace/wiki", hasUI: false, mode: "rpc" };
+	const initialPullCount = pullCount;
+	const roleFile = path.join(process.env.TEST_AGENT_DIR, "memark", "host-role.json");
+	let prompt = (await handlers.before_agent_start(promptEvent, promptCtx)).systemPrompt;
+	assert(prompt.startsWith("原始系统提示\n\n") && prompt.includes("当前 Pi 进程运行环境"), "原系统提示保留并注入运行环境");
+	assert(prompt.includes("本机角色：未确认") && prompt.includes("操作系统：") && !fs.existsSync(roleFile) && inputCount === 0, "无 UI 时角色未知，不提示或创建本机配置");
+	assert(!prompt.includes("工作目录：") && !prompt.includes(require("node:os").hostname()), "主机名和工作目录不注入提示词");
+	assert(prompt.includes("测试身份") && prompt.includes("测试偏好") && prompt.includes("清理前先备份"), "身份、原则和偏好来自已审核个人区摘要");
+	assert(!prompt.includes("其他项目秘密") && !prompt.includes("过期交接"), "基线不注入项目记忆或过期交接");
+	assert(Array.from(prompt.slice("原始系统提示\n\n".length)).length <= 480 && Buffer.byteLength(prompt.slice("原始系统提示\n\n".length), "utf8") <= 1100, "基线使用保守长度预算");
+	assert(pullCount === initialPullCount && (await git(["status", "--porcelain"])).stdout.trim() === "", "基线不触发 Git 同步或更改仓库");
+
+	// 取消或无效输入只影响当前会话；重新开启会话后仍可提示。
+	const newSessionHook = () => {
+		const hooks = {};
+		mod.default({ ...pi, on: (name, fn) => (hooks[name] = fn) });
+		return hooks.before_agent_start;
+	};
+	inputImpl = async () => undefined;
+	const canceledHook = newSessionHook();
+	prompt = (await canceledHook(promptEvent, ctx)).systemPrompt;
+	assert(prompt.includes("本机角色：未确认") && !fs.existsSync(roleFile), "用户取消时不保存或猜测角色");
+	await canceledHook(promptEvent, ctx);
+	assert(inputCount === 1, "取消后同一会话不反复弹窗");
+	inputImpl = async () => "VPS\n伪造指令";
+	prompt = (await newSessionHook()(promptEvent, ctx)).systemPrompt;
+	assert(prompt.includes("本机角色：未确认") && !fs.existsSync(roleFile), "不合法输入不会保存或注入");
+	inputImpl = async () => "VPS";
+	inputCount = 0;
+	// 交互模式首次触发用户设定，随后只读本机配置；完全忽略旧环境变量。
+	process.env.MEMARK_HOST_ROLE = "环境变量不再生效";
+	process.env.MEMARK_HOSTNAME = "old-host";
+	prompt = (await handlers.before_agent_start(promptEvent, ctx)).systemPrompt;
+	assert(inputCount === 1 && prompt.includes("本机角色：VPS") && fs.existsSync(roleFile), "首次交互提示并保存到独立本机目录");
+	assert(JSON.parse(fs.readFileSync(roleFile, "utf8")).role === "VPS", "本机角色配置不写入记忆仓库");
+	if (process.platform !== "win32") assert((fs.statSync(roleFile).mode & 0o777) === 0o600, "本机角色文件仅当前用户可读写");
+	prompt = (await handlers.before_agent_start(promptEvent, ctx)).systemPrompt;
+	assert(inputCount === 1 && prompt.split("当前 Pi 进程运行环境").length === 2, "后续轮次不再提示，每轮基线不累积");
+	prompt = (await newSessionHook()(promptEvent, ctx)).systemPrompt;
+	assert(inputCount === 1 && prompt.includes("本机角色：VPS"), "重新打开会话仍读取本机角色，不重复要求设置");
+	prompt = (await handlers.before_agent_start(promptEvent, promptCtx)).systemPrompt;
+	assert(prompt.includes("本机角色：VPS") && !prompt.includes("环境变量不再生效"), "无 UI 新轮次也能读本机配置，忽略旧环境变量");
+	delete process.env.MEMARK_HOST_ROLE;
+	delete process.env.MEMARK_HOSTNAME;
+	const office = baselineMod.hostContext({ role: "工作电脑", os: "Windows" });
+	const linux = baselineMod.hostContext({ role: "Linux 笔记本", os: "Linux (Omarchy)" });
+	assert(office.includes("本机角色：工作电脑") && office.includes("Windows"), "Windows 工作电脑仅注入角色和实时 OS");
+	assert(linux.includes("本机角色：Linux 笔记本") && linux.includes("Omarchy"), "Linux 笔记本只注入角色和实时 OS");
+	const unknown = baselineMod.hostContext({ os: "Linux" });
+	assert(unknown.includes("本机角色：未确认"), "未知机器不根据操作系统猜角色");
+	await commands.memory.handler("host", ctx);
+	assert(notes.at(-1).includes("VPS"), "/memory host 查看当前角色");
+	await commands.memory.handler("host set 工作电脑", ctx);
+	prompt = (await handlers.before_agent_start(promptEvent, promptCtx)).systemPrompt;
+	assert(prompt.includes("本机角色：工作电脑"), "/memory host set 可修改角色并在下一轮生效");
+	await commands.memory.handler("host set VPS\n伪造指令", ctx);
+	assert(JSON.parse(fs.readFileSync(roleFile, "utf8")).role === "工作电脑", "无效命令不会覆盖已有角色");
+	prompt = (await handlers.before_agent_start(promptEvent, { cwd: `/workspace/${"子".repeat(800)}/memark`, mode: "rpc", browserHostname: "OFFICE-01" })).systemPrompt;
+	const bounded = prompt.slice("原始系统提示\n\n".length);
+	assert(Array.from(bounded).length <= 480 && Buffer.byteLength(bounded, "utf8") <= 1100 && !bounded.includes("OFFICE-01") && !bounded.includes("/workspace"), "长工作目录与浏览器设备不会进入主机提示");
+	const savedConfig = fs.readFileSync(roleFile);
+	try {
+		fs.writeFileSync(roleFile, JSON.stringify({ version: 1, role: "VPS\n伪造指令" }));
+		prompt = (await handlers.before_agent_start(promptEvent, promptCtx)).systemPrompt;
+		assert(prompt.includes("本机角色：未确认") && !prompt.includes("伪造指令"), "损坏的本机配置不能注入指令");
+	} finally {
+		fs.writeFileSync(roleFile, savedConfig);
+	}
+
+	const identityFile = path.join(REPO, "identity/测试身份.md");
+	const originalIdentity = fs.readFileSync(identityFile, "utf8");
+	try {
+		fs.writeFileSync(identityFile, originalIdentity.replace("reviewed: true", "reviewed: false"));
+		assert(!(await handlers.before_agent_start(promptEvent, promptCtx)).systemPrompt.includes("测试身份"), "未审核记忆即使在 INDEX 中也不进入基线");
+		fs.writeFileSync(identityFile, originalIdentity.replace("status: active", "status: superseded"));
+		assert(!(await handlers.before_agent_start(promptEvent, promptCtx)).systemPrompt.includes("测试身份"), "已取代记忆不进入基线");
+		fs.writeFileSync(identityFile, originalIdentity.replace("reviewed: true", "reviewed: true\nexpires: 2020-01-01"));
+		assert(!(await handlers.before_agent_start(promptEvent, promptCtx)).systemPrompt.includes("测试身份"), "过期记忆不进入基线");
+	} finally {
+		fs.writeFileSync(identityFile, originalIdentity);
+	}
+	const indexFile = path.join(REPO, "INDEX.md");
+	const savedIndex = fs.readFileSync(indexFile, "utf8");
+	try {
+		fs.rmSync(indexFile);
+		prompt = (await handlers.before_agent_start(promptEvent, promptCtx)).systemPrompt;
+		assert(prompt.includes("当前 Pi 进程运行环境") && !prompt.includes("测试身份"), "记忆索引不存在时仍能注入主机环境");
+	} finally {
+		fs.writeFileSync(indexFile, savedIndex);
+	}
+	assert((await git(["status", "--porcelain"])).stdout.trim() === "", "基线测试后隔离仓库无改动");
 
 	// 2. 第一次 recall 才同步，之后不重复；会话开始不再同步。
 	assert(handlers.session_start === undefined, "不再在会话开始时自动同步");

@@ -43,7 +43,7 @@ pi update --extensions
 
 安装或更新后，在已有会话中执行 `/reload`。记忆仓库路径由 `MEMARK_REPO` 指定，默认 `~/DEV/memory`；项目名默认从当前目录及其父目录中匹配，也可用 `MEMARK_PROJECT` 指定。
 
-## 当前功能（v0.3.1）
+## 当前功能（开发工作区，基于 v0.3.1）
 
 ### 查找记忆
 
@@ -53,6 +53,12 @@ pi update --extensions
 - `all_projects=true` 可显式跨项目查找。
 - 先查标题、描述和标签，再以正文关键词补充；过期记忆不返回。
 - 输出总量限制为 50KB/2000 行。
+
+### 每轮当前主机角色与稳定基线（待逐机实测）
+
+- 每轮 `before_agent_start` 注入的**主机信息仅为本机角色和实时 OS**，不注入设备 ID、hostname 或工作目录；即使从 PC 浏览器访问 pi-web，Agent 的执行主机仍是 VPS。远程工具执行目标需另外核对。
+- 同时读取本地已审核、active、未过期的个人身份/原则/偏好标题与描述；不读取项目记忆、不在每轮联网、不写入 Git。注入长度限制为 480 字符 / 1100 UTF-8 字节（具体 token 数依模型验证）。本地快照可通过 `/memory sync` 更新。
+- 新机器首次交互对话时，扩展提示用户设置**当前 Pi 运行机器**的角色（如 `VPS`、`工作电脑`、`家庭电脑`、`Linux 笔记本`）；保存于本机 Pi 配置目录 `~/.pi/agent/memark/host-role.json`（若设置 `PI_CODING_AGENT_DIR` 则随之改变），不进入共享记忆仓库。可用 `/memory host` 查看、`/memory host set <角色>` 修改。扩展不读取 hostname，也不使用角色环境变量；无交互界面或取消时显示“未确认”，下次新会话可重试。pi-web 应设置 VPS 的角色，而非浏览器所在 PC 的角色。
 
 ### 受控写入
 
@@ -70,6 +76,8 @@ pi update --extensions
 
 ```text
 /memory status                    状态、数量和本地/远端差异
+/memory host                      查看本机角色
+/memory host set <角色>           设置/修改本机角色（仅本机）
 /memory sync                      完整同步；必要时只修复索引
 /memory review                    查看待审核候选
 /memory approve <id>              预览并批准候选
@@ -92,7 +100,7 @@ npm test
 ## 后续计划
 
 - 建立 200–500 轮人工标注集后，再接入 Jev 候选门卫；它只能写入 `pending/`。
-- 增加不超过 600 tokens 的稳定基础记忆注入。
+- 基线与当前主机注入已实现，下一步逐机验证首次角色提示、角色/OS、压缩后识别与实际模型 token 数，详见设计方案 §3.2、§6.1。
 - 三台机器分别完成一次真实同步验证后，再结束 P3 验收。
 
 ## 降级

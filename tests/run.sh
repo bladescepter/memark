@@ -14,6 +14,7 @@ BASE="${TMPDIR:-/tmp}/memark-test-$$"
 SEED="$BASE/seed"
 export TEST_REMOTE="$BASE/remote.git"
 export TEST_REPO="$BASE/repo"
+export TEST_AGENT_DIR="$BASE/agent"
 export NODE_PATH="$NPM_ROOT:$G"
 export PI_NODE_MODULES="$G"
 

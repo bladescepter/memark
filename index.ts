@@ -4,9 +4,10 @@
  * 当前版本：
  * - memark_recall：每个会话第一次实际查找时尝试同步；个人区 + 当前项目，支持显式跨项目
  * - memark_remember：临时校验 → 修改预览 → 用户确认 → 精确提交；失败降级 pending
- * - /memory：status / sync / review / approve / reject / maintain / forget / revert
+ * - /memory：status / sync / review / approve / reject / maintain / forget / revert / host
  *
- * Gate 与基线注入仍按重构方案后续阶段实施；Gate 只能产出 pending，不能正式写入。
+ * - 基线注入：每轮注入本机角色/实时 OS 与已审核个人记忆摘要（只读本地快照）
+ * Gate 尚未启用；Gate 只能产出 pending，不能正式写入。
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -22,6 +23,8 @@ import {
 	withRepoMutation,
 } from "./repo";
 import { handleMemoryCommand, listPendingIds, registerCurator } from "./curator";
+import { buildBaselineContext } from "./baseline";
+import { readHostRole, saveHostRole } from "./host-role";
 
 const MAX_OUTPUT_BYTES = 50 * 1024;
 const MAX_OUTPUT_LINES = 2000;
@@ -198,6 +201,31 @@ function truncateOutput(text: string): string {
 }
 
 export default function (pi: ExtensionAPI) {
+	let rolePrompted = false;
+	// 首次交互才请用户声明当前 Pi 主机的角色；无 UI 或取消时不猜测、不保存。
+	// 系统提示仅在本轮有效，不往会话历史或共享仓库写入动态主机信息。
+	pi.on("before_agent_start", async (event, ctx) => {
+		try {
+			if (!readHostRole() && ctx.hasUI && !rolePrompted) {
+				rolePrompted = true;
+				try {
+					const input = await ctx.ui.input("memark：首次使用，请设置当前 Pi 运行机器的角色", "例如 VPS、工作电脑、家庭电脑、Linux 笔记本");
+					if (input !== undefined) {
+						saveHostRole(input);
+						ctx.ui.notify("memark：本机角色已保存；可用 /memory host 修改。", "info");
+					}
+				} catch (err) {
+					ctx.ui.notify(`memark：角色未保存：${(err as Error).message}。请用 /memory host set <角色> 重试。`, "warning");
+				}
+			}
+			const context = buildBaselineContext();
+			return { systemPrompt: `${event.systemPrompt}\n\n${context}` };
+		} catch {
+			// 基线故障不影响正常对话，recall/remember 仍独立可用。
+			return;
+		}
+	});
+
 	let firstRecallSync: Promise<string | null> | null = null;
 
 	async function syncBeforeFirstRecall(): Promise<string | null> {
@@ -279,14 +307,16 @@ export default function (pi: ExtensionAPI) {
 	registerCurator(pi);
 
 	pi.registerCommand("memory", {
-		description: "memark：status / sync / review / approve / reject / maintain / forget / revert",
+		description: "memark：status / sync / review / approve / reject / maintain / forget / revert / host",
 		getArgumentCompletions: (prefix: string) => {
 			const items: { value: string; label: string }[] = [];
 			const parts = prefix.split(/\s+/);
 			if (parts.length <= 1) {
-				for (const command of ["status", "sync", "review", "approve", "reject", "maintain", "forget", "revert"]) {
+				for (const command of ["status", "sync", "review", "approve", "reject", "maintain", "forget", "revert", "host"]) {
 					if (command.startsWith(prefix)) items.push({ value: command, label: command });
 				}
+			} else if (parts[0] === "host") {
+				if ("set".startsWith(parts[1] ?? "")) items.push({ value: "host set ", label: "host set <角色>" });
 			} else if (parts[0] === "approve" || parts[0] === "reject") {
 				for (const id of listPendingIds()) {
 					if (id.startsWith(parts[1] ?? "")) items.push({ value: `${parts[0]} ${id}`, label: id });
@@ -301,6 +331,20 @@ export default function (pi: ExtensionAPI) {
 		},
 		handler: async (args, ctx) => {
 			try {
+				const command = (args ?? "").trim();
+				if (command === "host") {
+					ctx.ui.notify(`memark：本机角色：${readHostRole() ?? "未确认"}。修改：/memory host set <角色>；操作系统每轮实时识别。`, "info");
+					return;
+				}
+				if (command === "host set" || command.startsWith("host set ")) {
+					const role = saveHostRole(command.slice("host set".length));
+					ctx.ui.notify(`memark：本机角色已设为 ${role}（仅本机）；下一轮开始生效。`, "info");
+					return;
+				}
+				if (command.startsWith("host ")) {
+					ctx.ui.notify("用法：/memory host 或 /memory host set <角色>", "warning");
+					return;
+				}
 				await handleMemoryCommand(pi, args ?? "", ctx as never);
 			} catch (err) {
 				ctx.ui.notify(`memark：操作失败：${(err as Error).message}`, "error");
