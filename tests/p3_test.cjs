@@ -55,12 +55,16 @@ mod.default(pi);
 let confirmImpl = async () => true;
 let inputImpl = async () => "VPS";
 let inputCount = 0;
+let selectImpl = async () => "Yes";
+let editorImpl = async () => undefined;
 const notes = [];
 const ctx = {
 	hasUI: true,
 	ui: {
 		confirm: async (title, message) => confirmImpl(title, message),
 		input: async (title, placeholder) => { inputCount++; return inputImpl(title, placeholder); },
+		select: async (title, options) => selectImpl(title, options),
+		editor: async (title, prefill) => editorImpl(title, prefill),
 		notify: (message) => {
 			notes.push(String(message));
 			console.log(`  [notify] ${String(message).split("\n")[0]}`);
@@ -288,17 +292,20 @@ function addRemoteMemory() {
 		assert(String(error.message).includes("已存在"), "同名文件守卫生效");
 	}
 
-	// 5. 正式写入：确认前不触碰正式目录；只提交计划文件。
+	// 5. 正式写入：确认前不触碰正式目录；只提交计划文件；选项为 Yes / No / Edit。
 	const formalRel = "projects/wiki/topics/正式写入测试.md";
 	let checkedBeforeConfirm = false;
-	confirmImpl = async (_title, preview) => {
+	let selectOptionsSeen = null;
+	selectImpl = async (title, options) => {
+		selectOptionsSeen = options;
 		checkedBeforeConfirm = !fs.existsSync(path.join(REPO, formalRel));
-		assert(preview.includes(formalRel) && preview.includes("+ status: active"), "确认窗口展示修改预览");
-		return true;
+		assert(title.includes(formalRel) && title.includes("+ status: active"), "确认窗口展示修改预览");
+		return "Yes";
 	};
 	result = await remember({ title: "正式写入测试", description: "验证安全正式写入流程", body: "正式正文。", tags: ["测试"], zone: "project", project: "wiki", category: "topics", type: "Topic" });
-	confirmImpl = async () => true;
+	selectImpl = async () => "Yes";
 	assert(checkedBeforeConfirm, "用户确认前正式目录没有草案");
+	assert(JSON.stringify(selectOptionsSeen) === JSON.stringify(["Yes", "No", "Edit"]), "确认选项为 Yes / No / Edit");
 	assert(toolText(result).startsWith("✓"), "正式写入成功");
 	assert(fs.existsSync(path.join(REPO, formalRel)), "正式文件已创建");
 	assert(fs.readFileSync(path.join(REPO, "projects/wiki/INDEX.md"), "utf8").includes("正式写入测试"), "项目索引已更新");
@@ -309,6 +316,55 @@ function addRemoteMemory() {
 	result = await remember({ title: "新项目首条决策", description: "验证新项目自动建立路由", body: "新项目正文。", tags: ["测试"], zone: "project", project: "newproject", category: "decisions", type: "Decision" });
 	assert(toolText(result).startsWith("✓"), "可以写入尚未建立项目区的新项目");
 	assert(fs.existsSync(path.join(REPO, "projects/newproject/README.md")) && fs.existsSync(path.join(REPO, "projects/newproject/INDEX.md")), "新项目自动建立 README 和 INDEX");
+
+	// 5b. category 可省略：项目区与个人区 knowledge 按 type 自动归档；变体自动归一化。
+	result = await remember({ title: "自动归档决策", description: "省略 category 的项目区写入", body: "自动归档正文。", tags: ["测试"], zone: "project", project: "wiki", type: "Decision" });
+	assert(toolText(result).startsWith("✓") && fs.existsSync(path.join(REPO, "projects/wiki/decisions/自动归档决策.md")), "项目区省略 category 时按 type 自动归档");
+	result = await remember({ title: "自动归档技能", description: "省略 category 的 knowledge 写入", body: "技能正文。", tags: ["测试"], zone: "personal", layer: "knowledge", type: "Skill" });
+	assert(toolText(result).startsWith("✓") && fs.existsSync(path.join(REPO, "knowledge/skills/自动归档技能.md")), "个人区 knowledge 省略 category 时按 type 自动归档");
+	assert(tools.memark_remember.prepareArguments({ category: "Topic " }).category === "topics", "category 单复数与大小写自动归一化");
+	assert(tools.memark_remember.prepareArguments({ category: "Decisions" }).category === "decisions", "category 大写形式自动归一化");
+
+	// 5c. Edit 选项：编辑后写入；Esc 返回预览；破坏格式时提示并不写入。
+	let editStep = 0;
+	selectImpl = async () => (editStep++ === 0 ? "Edit" : "Yes");
+	editorImpl = async (_title, prefill) => String(prefill).replace("编辑前正文。", "编辑后正文。");
+	result = await remember({ title: "编辑流程测试", description: "验证 Edit 选项", body: "编辑前正文。", tags: ["测试"], zone: "personal", layer: "principles", type: "Principle" });
+	selectImpl = async () => "Yes";
+	editorImpl = async () => undefined;
+	assert(toolText(result).startsWith("✓") && fs.readFileSync(path.join(REPO, "principles/编辑流程测试.md"), "utf8").includes("编辑后正文。"), "Edit 编辑草案后确认写入");
+
+	editStep = 0;
+	selectImpl = async () => (editStep++ === 0 ? "Edit" : "No");
+	result = await remember({ title: "编辑取消测试", description: "验证 Esc 返回预览", body: "取消正文。", tags: ["测试"], zone: "personal", layer: "principles", type: "Principle" });
+	selectImpl = async () => "Yes";
+	assert(!fs.existsSync(path.join(REPO, "principles/编辑取消测试.md")) && toolText(result).includes("已取消"), "编辑器 Esc 返回预览后可取消");
+
+	editStep = 0;
+	const editTitles = [];
+	selectImpl = async (title) => { editTitles.push(String(title)); return editStep++ === 0 ? "Edit" : "No"; };
+	editorImpl = async (_title, prefill) => String(prefill).replace(/^---[\s\S]*?---/, "损坏的 frontmatter");
+	result = await remember({ title: "编辑失败测试", description: "验证校验失败的编辑", body: "失败正文。", tags: ["测试"], zone: "personal", layer: "principles", type: "Principle" });
+	selectImpl = async () => "Yes";
+	editorImpl = async () => undefined;
+	assert(editTitles.some((title) => title.includes("编辑未通过")), "破坏格式的编辑在预览中提示错误");
+	assert(!fs.existsSync(path.join(REPO, "principles/编辑失败测试.md")), "校验失败的编辑不会写入");
+
+	// 5d. /memory edit 与 memark_remember edit 参数：原地修改措辞。
+	const editTarget = "principles/编辑流程测试.md";
+	editorImpl = async (_title, prefill) => String(prefill).replace("编辑后正文。", "命令行编辑正文。");
+	await commands.memory.handler(`edit ${editTarget}`, ctx);
+	editorImpl = async () => undefined;
+	assert(fs.readFileSync(path.join(REPO, editTarget), "utf8").includes("命令行编辑正文。"), "/memory edit 原地更新记忆");
+	commitFiles = (await git(["show", "--name-only", "--format=", "HEAD"])).stdout;
+	assert(commitFiles.includes("编辑流程测试.md") && !commitFiles.includes("pending/"), "edit 的 commit 只包含该记忆");
+	assert((await git(["status", "--porcelain"])).stdout.trim() === "", "edit 后工作区干净");
+
+	result = await remember({ title: "编辑流程测试", description: "更新后的描述", body: "模型改写正文。", tags: ["测试"], zone: "personal", layer: "principles", type: "Principle", edit: editTarget });
+	assert(toolText(result).startsWith("✓"), "memark_remember edit 参数原地改写");
+	const editedText = fs.readFileSync(path.join(REPO, editTarget), "utf8");
+	assert(editedText.includes("模型改写正文。") && editedText.includes("更新后的描述"), "edit 参数更新正文与描述");
+	assert(editedText.includes("type: Principle") && /^timestamp: \d{4}-\d{2}-\d{2}$/m.test(editedText), "edit 参数保留原 type 与 timestamp");
 
 	// 6. approve：pending 不进入 commit，批准后仓库保持干净。
 	await remember({ title: "批准流程测试", description: "验证 pending approve", body: "批准正文。\ntarget: 正文中的普通文本", tags: ["测试"], zone: "personal", layer: "principles", type: "Principle", as_pending: true });
@@ -322,6 +378,17 @@ function addRemoteMemory() {
 	assert(!commitFiles.includes("pending/"), "approve 的 commit 不包含 pending");
 	assert((await git(["status", "--porcelain"])).stdout.trim() === "", "approve 后工作区干净");
 
+	// 6b. approve 前可先编辑措辞。
+	await remember({ title: "批准编辑测试", description: "验证批准前编辑", body: "批准前正文。", tags: ["测试"], zone: "personal", layer: "principles", type: "Principle", as_pending: true });
+	pending = pendingFiles()[0];
+	let approveStep = 0;
+	selectImpl = async () => (approveStep++ === 0 ? "Edit" : "Yes");
+	editorImpl = async (_title, prefill) => String(prefill).replace("批准前正文。", "批准时编辑正文。");
+	await commands.memory.handler(`approve ${pending.replace(/\.md$/, "")}`, ctx);
+	selectImpl = async () => "Yes";
+	editorImpl = async () => undefined;
+	assert(fs.readFileSync(path.join(REPO, "principles/批准编辑测试.md"), "utf8").includes("批准时编辑正文。"), "approve 支持批准前编辑措辞");
+
 	// 7. supersedes 同 commit 更新旧状态。
 	result = await remember({ title: "最小改动原则新版", description: "取代旧版最小改动原则", body: "使用新版原则。", tags: ["测试"], zone: "personal", layer: "principles", type: "Principle", supersedes: "principles/能不动就不动.md" });
 	assert(toolText(result).startsWith("✓"), "supersedes 写入成功");
@@ -330,7 +397,7 @@ function addRemoteMemory() {
 	assert(commitFiles.includes("最小改动原则新版.md") && commitFiles.includes("能不动就不动.md"), "新旧状态位于同一个 commit");
 
 	const raceWriter = path.join(BASE, "remote-writer");
-	confirmImpl = async () => {
+	selectImpl = async () => {
 		shell(`git -C "${raceWriter}" pull -q --ff-only`);
 		const raceFile = path.join(raceWriter, "preferences", "确认期间远端更新.md");
 		fs.writeFileSync(raceFile, `---\ntype: Preference\ntitle: 确认期间远端更新\ndescription: 验证确认期间远端变化会停止旧预览提交\nstatus: active\nprivacy: internal\ntags: [同步, 测试]\ntimestamp: 2026-09-22\nsource: user-confirmed\nreviewed: true\n---\n\n远端竞态测试。\n`);
@@ -338,10 +405,10 @@ function addRemoteMemory() {
 		shell(`git -C "${raceWriter}" add -- preferences/确认期间远端更新.md INDEX.md`);
 		shell(`git -C "${raceWriter}" commit -q -m "memory: remote race fixture"`);
 		shell(`git -C "${raceWriter}" push -q`);
-		return true;
+		return "Yes";
 	};
 	result = await remember({ title: "远端竞态保护测试", description: "远端变化时不使用旧预览提交", body: "应降级待审。", tags: ["测试"], zone: "personal", layer: "principles", type: "Principle" });
-	confirmImpl = async () => true;
+	selectImpl = async () => "Yes";
 	assert(!fs.existsSync(path.join(REPO, "principles/远端竞态保护测试.md")), "确认期间远端变化时不写入旧草案");
 	assert(toolText(result).includes("候选保留") && pendingFiles().length === 1, "远端变化时降级保存 pending");
 	fs.rmSync(path.join(REPO, "pending", pendingFiles()[0]));

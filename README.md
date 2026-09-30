@@ -43,7 +43,7 @@ pi update --extensions
 
 安装或更新后，在已有会话中执行 `/reload`。记忆仓库路径由 `MEMARK_REPO` 指定，默认 `~/DEV/memory`；项目名默认从当前目录及其父目录中匹配，也可用 `MEMARK_PROJECT` 指定。
 
-## 当前功能（开发工作区，基于 v0.3.1）
+## 当前功能（开发工作区，基于 v0.3.2）
 
 ### 查找记忆
 
@@ -66,9 +66,11 @@ pi update --extensions
 
 1. 下载远端最新版本并确认仓库没有未处理修改；
 2. 在临时副本中生成草案、索引并运行格式、重复、链接和敏感信息检查；
-3. 展示修改前后预览；
+3. 展示修改前后预览，选项为 Yes / No / Edit：Edit 在终端编辑器打开草案全文（Ctrl+G 可调 vim/nano），保存后重新校验并回到预览；
 4. 用户确认后才写入正式目录；
 5. 只提交本次计划内文件，然后上传。
+
+`category` 通常可省略：项目区按 type 自动归入 decisions/topics/incidents/handoffs，个人区 knowledge 按 type 归入 skills/experiences/learnings；单复数与大小写自动归一化。调整已入库记忆的措辞可提供 `edit=<仓库相对路径>` 原地更新（只改标题、描述、标签和正文，保留原 type/timestamp/scope/expires/supersedes）。
 
 无 UI、离线或仓库有未处理修改时，候选只保存在本机 `pending/`，不会进入 Git。写入按顺序执行，并使用本机仓库锁防止多个 pi 进程互相覆盖。
 
@@ -80,10 +82,11 @@ pi update --extensions
 /memory host set <角色>           设置/修改本机角色（仅本机）
 /memory sync                      完整同步；必要时只修复索引
 /memory review                    查看待审核候选
-/memory approve <id>              预览并批准候选
+/memory approve <id>              预览并批准候选（可先 Edit 调整措辞）
 /memory reject <id> [原因]        拒绝候选；原因记入当前会话审计
 /memory maintain                  只读校验并列出过期记忆
 /memory forget <path>             按原目录结构移入 archive/
+/memory edit <path>               在终端编辑器中原地编辑记忆
 /memory revert                    安全撤销最近一次记忆修改
 ```
 
@@ -95,7 +98,7 @@ pi update --extensions
 npm test
 ```
 
-测试先执行严格的 TypeScript 类型检查，再使用 `tests/fixtures/memory/` 中完全虚构的独立记忆库；不读取私人 `~/DEV/memory`。覆盖首次查找同步、项目隔离、待审核批准/拒绝、敏感信息、路径越界、失败恢复、并发写入、远端竞态、归档、撤销和索引修复。GitHub 在每次推送和合并请求时自动运行同一套测试。
+测试先执行严格的 TypeScript 类型检查，再使用 `tests/fixtures/memory/` 中完全虚构的独立记忆库；不读取私人 `~/DEV/memory`。覆盖首次查找同步、项目隔离、待审核批准/拒绝、确认前编辑、原地编辑、敏感信息、路径越界、失败恢复、并发写入、远端竞态、归档、撤销、索引修复和基线/本机角色注入。GitHub 在每次推送和合并请求时自动运行同一套测试。
 
 ## 后续计划
 

@@ -57,6 +57,36 @@ const PROJECT_TYPES: Record<string, string[]> = {
 };
 const ALL_TYPES = ["Identity", "Principle", "Preference", "Context", "Skill", "Experience", "Learning", "Decision", "Topic", "Incident", "Handoff"] as const;
 const PROJECT_TYPE_NAMES = ["Decision", "Topic", "Incident", "Handoff"];
+const PROJECT_CATEGORY_BY_TYPE: Record<string, string> = {
+	Decision: "decisions",
+	Topic: "topics",
+	Incident: "incidents",
+	Handoff: "handoffs",
+};
+const PERSONAL_CATEGORY_BY_TYPE: Record<string, string> = {
+	Skill: "skills",
+	Experience: "experiences",
+	Learning: "learnings",
+};
+const CATEGORY_ALIASES: Record<string, string> = {
+	decision: "decisions",
+	decisions: "decisions",
+	topic: "topics",
+	topics: "topics",
+	incident: "incidents",
+	incidents: "incidents",
+	handoff: "handoffs",
+	handoffs: "handoffs",
+	current: "current",
+	relationship: "relationships",
+	relationships: "relationships",
+	skill: "skills",
+	skills: "skills",
+	experience: "experiences",
+	experiences: "experiences",
+	learning: "learnings",
+	learnings: "learnings",
+};
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const WRITE_TIMEOUT_MS = 30_000;
 
@@ -72,6 +102,7 @@ export interface Draft {
 	type: string;
 	expires?: string;
 	supersedes?: string;
+	edit?: string;
 	timestamp?: string;
 }
 
@@ -80,6 +111,8 @@ interface Ctx {
 	ui: {
 		confirm: (title: string, message: string) => Promise<boolean>;
 		notify: (message: string, tone?: "info" | "warning" | "error") => void;
+		select?: (title: string, options: string[]) => Promise<string | undefined>;
+		editor?: (title: string, prefill?: string) => Promise<string | undefined>;
 	};
 	cwd?: string;
 }
@@ -104,6 +137,12 @@ function validDate(value: string): boolean {
 
 function scalar(value: string): string {
 	return JSON.stringify(value);
+}
+
+/** 容错归一化 category 常见变体（单复数、大小写）；未匹配时原样返回，交由枚举校验拒绝。 */
+function normalizeCategory(value: string): string {
+	const key = value.trim().toLocaleLowerCase();
+	return CATEGORY_ALIASES[key] ?? value.trim();
 }
 
 function validateDraft(d: Draft): void {
@@ -141,10 +180,15 @@ export function resolveTargetPath(d: Draft): { path: string | null; error?: stri
 			if (!PERSONAL_TYPES[layer].includes(d.type)) {
 				return { path: null, error: `${layer}/ 的 type 须为 ${PERSONAL_TYPES[layer].join("/")}` };
 			}
-			if (d.category && !(PERSONAL_SUBDIRS[layer] ?? []).includes(d.category)) {
-				return { path: null, error: `${layer}/ 不允许二级目录 ${d.category}` };
+			// knowledge 层省略 category 时按 type 自动归入标准子目录；其余层保持原行为。
+			const category = d.category ?? (layer === "knowledge" ? PERSONAL_CATEGORY_BY_TYPE[d.type] : undefined);
+			if (category && !(PERSONAL_SUBDIRS[layer] ?? []).includes(category)) {
+				return {
+					path: null,
+					error: `${layer}/ 不允许二级目录 ${category}（context: current/relationships；knowledge: skills/experiences/learnings）`,
+				};
 			}
-			rel = d.category ? `${layer}/${d.category}/${filename}.md` : `${layer}/${filename}.md`;
+			rel = category ? `${layer}/${category}/${filename}.md` : `${layer}/${filename}.md`;
 		} else {
 			const project = d.project?.trim() ?? "";
 			if (!project || !/^[\w\u4e00-\u9fff.-]+$/.test(project) || project === "." || project === ".." || /[. ]$/.test(project) ||
@@ -153,17 +197,21 @@ export function resolveTargetPath(d: Draft): { path: string | null; error?: stri
 			}
 			if (d.category) {
 				if (!PROJECT_TYPES[d.category]) {
-					return { path: null, error: `项目区 category 必须是 ${Object.keys(PROJECT_TYPES).join("/")}` };
+					return {
+						path: null,
+						error: `项目区 category 只能是 ${Object.keys(PROJECT_TYPES).join("/")}；通常可省略，将按 type 自动归入对应目录`,
+					};
 				}
 				if (!PROJECT_TYPES[d.category].includes(d.type)) {
 					return { path: null, error: `${d.category}/ 的 type 须为 ${PROJECT_TYPES[d.category].join("/")}` };
 				}
 				rel = `projects/${project}/${d.category}/${filename}.md`;
 			} else {
-				if (!PROJECT_TYPE_NAMES.includes(d.type)) {
-					return { path: null, error: `项目区 type 须为 ${PROJECT_TYPE_NAMES.join("/")}` };
+				const category = PROJECT_CATEGORY_BY_TYPE[d.type];
+				if (!category) {
+					return { path: null, error: `项目区 type 须为 ${PROJECT_TYPE_NAMES.join("/")}；category 可省略（按 type 自动归档）` };
 				}
-				rel = `projects/${project}/${filename}.md`;
+				rel = `projects/${project}/${category}/${filename}.md`;
 			}
 		}
 		return { path: resolveRepoPath(rel).rel };
@@ -433,6 +481,12 @@ async function withFileQueues<T>(paths: string[], fn: () => Promise<T>): Promise
 	return enter(0);
 }
 
+/** 可在确认阶段编辑的草案：rel 指向主要记忆文件，rebuild 把编辑后全文重新组装成变更集。 */
+interface EditableDraft {
+	rel: string;
+	rebuild: (content: string) => Promise<{ changes: Changes } | { error: string }>;
+}
+
 async function commitPreparedChanges(
 	pi: ExtensionAPI,
 	ctx: Ctx,
@@ -440,6 +494,7 @@ async function commitPreparedChanges(
 	baseHead: string,
 	confirmTitle: string,
 	commitSubject: string,
+	editable?: EditableDraft,
 ): Promise<WriteResult> {
 	let prepared: Changes;
 	try {
@@ -448,8 +503,43 @@ async function commitPreparedChanges(
 		return { success: false, text: `✗ 草案校验未通过，正式仓库未改动：\n${(err as Error).message}` };
 	}
 
-	const approved = ctx.hasUI ? await ctx.ui.confirm(confirmTitle, changePreview(prepared)) : false;
-	if (!approved) return { success: false, text: "已取消，正式仓库未改动。" };
+	// 三选项确认：Yes 写入 / No 取消 / Edit 在终端编辑器中修改草案后重新校验。
+	const select = ctx.hasUI && typeof ctx.ui.select === "function" ? ctx.ui.select : undefined;
+	const editor = ctx.hasUI && typeof ctx.ui.editor === "function" ? ctx.ui.editor : undefined;
+	const canEdit = Boolean(select && editor && editable);
+	let banner = "";
+	while (true) {
+		let approved = false;
+		if (canEdit) {
+			const choice = await select!(`${banner}${confirmTitle}\n${changePreview(prepared)}`, ["Yes", "No", "Edit"]);
+			if (choice === "Edit") {
+				const current = prepared.get(editable!.rel);
+				if (typeof current !== "string") {
+					banner = "⚠ 找不到可编辑的草案文件。\n\n";
+					continue;
+				}
+				const edited = await editor!(`memark：编辑 ${editable!.rel}（Enter 保存 / Esc 返回预览）`, current);
+				if (edited === undefined || edited === current) continue;
+				try {
+					const rebuilt = await editable!.rebuild(edited);
+					if ("error" in rebuilt) {
+						banner = `⚠ 编辑未通过：${rebuilt.error}\n\n`;
+					} else {
+						prepared = await prepareChanges(pi, rebuilt.changes);
+						banner = "";
+					}
+				} catch (err) {
+					banner = `⚠ 编辑未通过：${(err as Error).message}\n\n`;
+				}
+				continue;
+			}
+			approved = choice === "Yes";
+		} else {
+			approved = ctx.hasUI ? await ctx.ui.confirm(confirmTitle, changePreview(prepared)) : false;
+		}
+		if (!approved) return { success: false, text: "已取消，正式仓库未改动。" };
+		break;
+	}
 
 	// 用户确认期间远端可能变化；再次同步。若 HEAD 改变，不使用旧预览继续提交。
 	const pull = await git(pi, ["pull", "--ff-only", "--quiet"], { timeout: WRITE_TIMEOUT_MS });
@@ -546,6 +636,27 @@ async function prepareWritableRepo(pi: ExtensionAPI): Promise<{ head?: string; r
 	return { head: (await git(pi, ["rev-parse", "HEAD"])).stdout.trim() };
 }
 
+/** 组装写入变更集：新记忆文件 + supersedes 旧记忆状态翻转；返回错误文案表示组装失败。 */
+async function buildWriteChanges(rel: string, content: string): Promise<Changes | string> {
+	const changes: Changes = new Map([[rel, content]]);
+	const supersedes = parseSimpleFrontmatter(content).supersedes;
+	if (!supersedes) return changes;
+	let oldRel: string;
+	try {
+		oldRel = resolveRepoPath(supersedes).rel;
+	} catch (err) {
+		return `✗ supersedes 路径无效：${(err as Error).message}`;
+	}
+	if (!isFormalMemoryPath(oldRel)) return "✗ supersedes 不是正式记忆路径";
+	if (oldRel === rel) return "✗ 新记忆不能用同一路径取代自身";
+	const oldPath = resolveRepoPath(oldRel).abs;
+	if (!existsSync(oldPath)) return `✗ supersedes 目标不存在：${oldRel}`;
+	const oldText = readFileSync(oldPath, "utf8");
+	if (!/^status: active$/m.test(oldText)) return `✗ 只能取代 active 记忆：${oldRel}`;
+	changes.set(oldRel, oldText.replace(/^status: active$/m, "status: superseded"));
+	return changes;
+}
+
 async function writeFormal(
 	pi: ExtensionAPI,
 	ctx: Ctx,
@@ -560,19 +671,71 @@ async function writeFormal(
 		if (ready.result) return ready.result;
 		if (existsSync(resolveRepoPath(rel).abs)) return { success: false, text: `✗ 目标文件已存在：${rel}` };
 
-		const changes: Changes = new Map([[rel, content]]);
-		const supersedes = parseSimpleFrontmatter(content).supersedes;
-		if (supersedes) {
-			const oldRel = resolveRepoPath(supersedes).rel;
-			if (!isFormalMemoryPath(oldRel)) return { success: false, text: "✗ supersedes 不是正式记忆路径" };
-			const oldPath = resolveRepoPath(oldRel).abs;
-			if (!existsSync(oldPath)) return { success: false, text: `✗ supersedes 目标不存在：${oldRel}` };
-			const oldText = readFileSync(oldPath, "utf8");
-			if (!/^status: active$/m.test(oldText)) return { success: false, text: `✗ 只能取代 active 记忆：${oldRel}` };
-			changes.set(oldRel, oldText.replace(/^status: active$/m, "status: superseded"));
-		}
+		const first = await buildWriteChanges(rel, content);
+		if (typeof first === "string") return { success: false, text: first };
 		const subject = `memory: ${rel}${commitNote ? ` (${commitNote})` : ""}`;
-		const result = await commitPreparedChanges(pi, ctx, changes, ready.head!, "memark：确认以下修改？", subject);
+		const result = await commitPreparedChanges(pi, ctx, first, ready.head!, "memark：确认以下修改？", subject, {
+			rel,
+			rebuild: async (edited) => {
+				const rebuilt = await buildWriteChanges(rel, edited);
+				return typeof rebuilt === "string" ? { error: rebuilt } : { changes: rebuilt };
+			},
+		});
+		if (result.success) result.text = `${result.text}\n${rel}`;
+		return result;
+	});
+}
+
+/** 用新措辞重建记忆文件；frontmatter 其余字段沿用原值。 */
+function buildEditedFile(d: Draft, fm: Record<string, string>): string {
+	validateDraft(d);
+	const lines = [
+		"---",
+		`type: ${d.type}`,
+		`title: ${scalar(d.title.trim())}`,
+		`description: ${scalar(d.description.trim())}`,
+		`status: ${fm.status ?? "active"}`,
+		`privacy: ${fm.privacy ?? "internal"}`,
+		`tags: [${d.tags.map((tag) => scalar(tag.trim())).join(", ")}]`,
+		`timestamp: ${d.timestamp ?? today()}`,
+	];
+	if (fm.scope) lines.push(`scope: ${fm.scope}`);
+	if (d.expires) lines.push(`expires: ${d.expires}`);
+	if (fm.supersedes) lines.push(`supersedes: ${fm.supersedes}`);
+	lines.push(`source: ${fm.source ?? "user-confirmed"}`, `reviewed: ${fm.reviewed ?? "true"}`, "---", "", d.body.trim(), "");
+	return lines.join("\n");
+}
+
+/** 由模型改写已有记忆的措辞：只更新标题、描述、标签和正文，其余 frontmatter 沿用原值。 */
+async function writeEdited(pi: ExtensionAPI, ctx: Ctx, relInput: string, d: Draft): Promise<WriteResult> {
+	return withRepoMutation(async () => {
+		const rel = resolveRepoPath(relInput).rel;
+		if (!isFormalMemoryPath(rel)) return { success: false, text: `✗ 不是合法的正式记忆路径：${rel}` };
+		const ready = await prepareWritableRepo(pi);
+		if (ready.result) return ready.result;
+		const source = resolveRepoPath(rel).abs;
+		if (!existsSync(source)) return { success: false, text: `✗ 待编辑记忆不存在：${rel}` };
+		const original = readFileSync(source, "utf8");
+		if (!/^status: active$/m.test(original)) return { success: false, text: `✗ 只能编辑 status: active 的记忆：${rel}` };
+		const fm = parseSimpleFrontmatter(original);
+		const effective: Draft = {
+			...d,
+			type: fm.type ?? d.type,
+			timestamp: fm.timestamp,
+			expires: fm.expires,
+			supersedes: undefined,
+		};
+		let content: string;
+		try {
+			content = buildEditedFile(effective, fm);
+		} catch (err) {
+			return { success: false, text: `✗ 编辑草案未通过校验：${(err as Error).message}` };
+		}
+		const changes: Changes = new Map([[rel, content]]);
+		const result = await commitPreparedChanges(pi, ctx, changes, ready.head!, "memark：确认编辑以下记忆？", `memory: edit ${rel}`, {
+			rel,
+			rebuild: async (edited) => ({ changes: new Map([[rel, edited]]) }),
+		});
 		if (result.success) result.text = `${result.text}\n${rel}`;
 		return result;
 	});
@@ -583,9 +746,10 @@ export function registerCurator(pi: ExtensionAPI): void {
 		name: "memark_remember",
 		label: "Memory Remember",
 		description:
-			"将一条用户明确要求记住的内容写入记忆仓库：先在临时副本校验并展示修改预览，用户确认后才写入正式目录、精确提交并推送。" +
+			"将一条用户明确要求记住的内容写入记忆仓库：先在临时副本校验并展示修改预览（Yes / No / Edit，可当场编辑措辞），用户确认后才写入正式目录、精确提交并推送。" +
 			"无 UI、离线或仓库存在未处理修改时，只保存到本机 pending/ 待审核区。" +
-			"个人区 zone=personal；项目区 zone=project，Handoff 必须设置 expires。仅在用户明确要求记住时调用。",
+			"个人区 zone=personal；项目区 zone=project（category 可省略，按 type 自动归档），Handoff 必须设置 expires。" +
+			"调整已有记忆措辞时提供 edit=<仓库相对路径> 原地更新。仅在用户明确要求记住或修改时调用。",
 		promptSnippet: "Write an explicitly requested memory through memark's reviewed draft flow",
 		promptGuidelines: [
 			"Use memark_remember only when the user explicitly asks to remember something; formal storage always requires a displayed preview and user confirmation.",
@@ -597,22 +761,41 @@ export function registerCurator(pi: ExtensionAPI): void {
 			tags: Type.Array(Type.String(), { minItems: 1, description: "跨目录主题标签" }),
 			zone: StringEnum(["personal", "project"] as const),
 			layer: Type.Optional(StringEnum(["identity", "principles", "preferences", "context", "knowledge"] as const)),
-			category: Type.Optional(Type.String({ description: "二级分类（可选）" })),
+			category: Type.Optional(StringEnum([
+				"decisions", "topics", "incidents", "handoffs",
+				"current", "relationships", "skills", "experiences", "learnings",
+			] as const, {
+				description: "二级分类，通常可省略：项目区按 type 自动归入 decisions/topics/incidents/handoffs；个人区 knowledge 按 type 归入 skills/experiences/learnings，context 可用 current/relationships",
+			})),
 			project: Type.Optional(Type.String({ description: "项目名（zone=project 必填）" })),
 			type: StringEnum(ALL_TYPES),
 			expires: Type.Optional(Type.String({ description: "真实的 YYYY-MM-DD 日期（Handoff 必填）" })),
 			supersedes: Type.Optional(Type.String({ description: "被取代记忆的仓库相对路径" })),
+			edit: Type.Optional(Type.String({
+				description: "原地改写的已有记忆仓库相对路径（调整措辞）；提供时只采用 title/description/body/tags，保留原 type/timestamp/scope/expires/supersedes",
+			})),
 			as_pending: Type.Optional(Type.Boolean({ description: "只保存为本机待审核候选" })),
 		}),
+		prepareArguments(args) {
+			if (!args || typeof args !== "object") return args as never;
+			const input = args as { category?: unknown };
+			if (typeof input.category !== "string") return args as never;
+			const normalized = normalizeCategory(input.category);
+			return (normalized === input.category ? args : { ...args, category: normalized }) as never;
+		},
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			try {
 				if (signal?.aborted) throw new Error("操作已取消");
 				const draft = params as unknown as Draft;
+				if (draft.edit) {
+					const result = await writeEdited(pi, ctx as Ctx, draft.edit, draft);
+					return { content: [{ type: "text", text: result.text }], details: {} };
+				}
 				const target = resolveTargetPath(draft);
 				if (target.error || !target.path) throw new Error(target.error ?? "无法解析目标路径");
 				const rel = target.path;
 				if (existsSync(resolveRepoPath(rel).abs)) {
-					throw new Error(`目标文件已存在：${rel}。如需替代旧记忆，请使用新标题并设置 supersedes。`);
+					throw new Error(`目标文件已存在：${rel}。调整措辞请用 edit 参数原地更新；替代旧记忆请用新标题并设置 supersedes。`);
 				}
 				if (draft.supersedes && resolveRepoPath(draft.supersedes).rel === rel) {
 					throw new Error("新记忆不能用同一路径取代自身");
@@ -840,6 +1023,40 @@ export async function handleMemoryCommand(pi: ExtensionAPI, args: string, ctx: C
 		return;
 	}
 
+	if (cmd === "edit") {
+		const input = rest[0];
+		if (!input) {
+			notify("用法：/memory edit <正式记忆相对路径>", "warning");
+			return;
+		}
+		let result: WriteResult;
+		try {
+			result = await withRepoMutation(async () => {
+				const rel = resolveRepoPath(input).rel;
+				if (!isFormalMemoryPath(rel)) return { success: false, text: `拒绝编辑非正式记忆路径：${rel}` };
+				const ready = await prepareWritableRepo(pi);
+				if (ready.result) return ready.result;
+				const source = resolveRepoPath(rel).abs;
+				if (!existsSync(source)) return { success: false, text: `文件不存在：${rel}` };
+				const editor = ctx.hasUI && typeof ctx.ui.editor === "function" ? ctx.ui.editor : undefined;
+				if (!editor) return { success: false, text: "编辑需要在交互模式的终端编辑器中进行。" };
+				const original = readFileSync(source, "utf8");
+				const edited = await editor(`memark：编辑 ${rel}（Enter 保存 / Esc 取消）`, original);
+				if (edited === undefined) return { success: false, text: "已取消，正式仓库未改动。" };
+				if (edited === original) return { success: false, text: "内容未变化，正式仓库未改动。" };
+				const changes: Changes = new Map([[rel, edited]]);
+				return commitPreparedChanges(pi, ctx, changes, ready.head!, "memark：确认编辑以下记忆？", `memory: edit ${rel}`, {
+					rel,
+					rebuild: async (content) => ({ changes: new Map([[rel, content]]) }),
+				});
+			});
+		} catch (err) {
+			result = { success: false, text: `编辑失败：${(err as Error).message}` };
+		}
+		notify(result.text, result.success ? "info" : "error");
+		return;
+	}
+
 	if (cmd === "sync") {
 		try {
 			const result = await syncRepository(pi);
@@ -945,5 +1162,5 @@ export async function handleMemoryCommand(pi: ExtensionAPI, args: string, ctx: C
 		return;
 	}
 
-	notify(`未知子命令：${cmd}。可用：status / sync / review / approve / reject / maintain / forget / revert`, "warning");
+	notify(`未知子命令：${cmd}。可用：status / sync / review / approve / reject / maintain / forget / edit / revert`, "warning");
 }

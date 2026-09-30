@@ -4,7 +4,7 @@
  * 当前版本：
  * - memark_recall：每个会话第一次实际查找时尝试同步；个人区 + 当前项目，支持显式跨项目
  * - memark_remember：临时校验 → 修改预览 → 用户确认 → 精确提交；失败降级 pending
- * - /memory：status / sync / review / approve / reject / maintain / forget / revert / host
+ * - /memory：status / sync / review / approve / reject / maintain / forget / edit / revert / host
  *
  * - 基线注入：每轮注入本机角色/实时 OS 与已审核个人记忆摘要（只读本地快照）
  * Gate 尚未启用；Gate 只能产出 pending，不能正式写入。
@@ -307,12 +307,12 @@ export default function (pi: ExtensionAPI) {
 	registerCurator(pi);
 
 	pi.registerCommand("memory", {
-		description: "memark：status / sync / review / approve / reject / maintain / forget / revert / host",
+		description: "memark：status / sync / review / approve / reject / maintain / forget / edit / revert / host",
 		getArgumentCompletions: (prefix: string) => {
 			const items: { value: string; label: string }[] = [];
 			const parts = prefix.split(/\s+/);
 			if (parts.length <= 1) {
-				for (const command of ["status", "sync", "review", "approve", "reject", "maintain", "forget", "revert", "host"]) {
+				for (const command of ["status", "sync", "review", "approve", "reject", "maintain", "forget", "edit", "revert", "host"]) {
 					if (command.startsWith(prefix)) items.push({ value: command, label: command });
 				}
 			} else if (parts[0] === "host") {
@@ -321,10 +321,10 @@ export default function (pi: ExtensionAPI) {
 				for (const id of listPendingIds()) {
 					if (id.startsWith(parts[1] ?? "")) items.push({ value: `${parts[0]} ${id}`, label: id });
 				}
-			} else if (parts[0] === "forget") {
+			} else if (parts[0] === "forget" || parts[0] === "edit") {
 				for (const line of [...readIndex(), ...allProjectIndexLines()]) {
 					const rel = pathFromIndexLine(line);
-					if (rel && rel.startsWith(parts[1] ?? "")) items.push({ value: `forget ${rel}`, label: rel });
+					if (rel && rel.startsWith(parts[1] ?? "")) items.push({ value: `${parts[0]} ${rel}`, label: rel });
 				}
 			}
 			return items.length > 0 ? items : null;
