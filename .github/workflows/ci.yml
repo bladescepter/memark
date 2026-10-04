@@ -10,6 +10,9 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        pi-version: ["0.85.1", "0.87.1"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -17,4 +20,6 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci --ignore-scripts
+      - if: matrix.pi-version != '0.85.1'
+        run: npm install --no-save --package-lock=false --ignore-scripts @earendil-works/pi-ai@${{ matrix.pi-version }} @earendil-works/pi-coding-agent@${{ matrix.pi-version }} @earendil-works/pi-tui@${{ matrix.pi-version }}
       - run: npm test

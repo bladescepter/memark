@@ -4,7 +4,7 @@ set -eu
 
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ROOT=$(CDPATH= cd -- "$HERE/.." && pwd)
-if [ -d "$ROOT/node_modules/@earendil-works/pi-coding-agent/node_modules" ]; then
+if [ -f "$ROOT/node_modules/@earendil-works/pi-coding-agent/package.json" ]; then
   NPM_ROOT="$ROOT/node_modules"
 else
   NPM_ROOT="$(npm root -g 2>/dev/null)"
@@ -43,4 +43,5 @@ git -C "$TEST_REPO" config user.name memark-test
 git -C "$TEST_REPO" config core.hooksPath .githooks
 git -C "$TEST_REPO" config core.quotepath false
 
+node "$HERE/review_test.cjs"
 node "$HERE/p3_test.cjs"

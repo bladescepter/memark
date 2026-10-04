@@ -41,9 +41,11 @@ pi install git:github.com/bladescepter/memark
 pi update --extensions
 ```
 
-安装或更新后，在已有会话中执行 `/reload`。记忆仓库路径由 `MEMARK_REPO` 指定，默认 `~/DEV/memory`；项目名默认从当前目录及其父目录中匹配，也可用 `MEMARK_PROJECT` 指定。
+需 Node.js 22.19+、Pi 0.85.1 或更新版本。安装或更新后，在**实际执行工具的每个 Pi 实例**中执行 `/reload`，再用 `/memory status` 核对运行版本、加载路径与磁盘指纹。磁盘代码已更新不代表旧进程已加载；`/memory sync` 只同步记忆数据，不升级扩展。
 
-## 当前功能（开发工作区，基于 v0.3.2）
+记忆仓库路径由 `MEMARK_REPO` 指定，默认 `~/DEV/memory`；项目名默认从当前目录及其父目录中匹配，也可用 `MEMARK_PROJECT` 指定。
+
+## 当前功能（v0.3.3，待逐机交互验收）
 
 ### 查找记忆
 
@@ -66,18 +68,24 @@ pi update --extensions
 
 1. 下载远端最新版本并确认仓库没有未处理修改；
 2. 在临时副本中生成草案、索引并运行格式、重复、链接和敏感信息检查；
-3. 展示修改前后预览，选项为 Yes / No / Edit：Edit 在终端编辑器打开草案全文（Ctrl+G 可调 vim/nano），保存后重新校验并回到预览；
+3. 展示完整 Git diff 与归属/文件清单，选项为 Yes / No / Edit；Edit 可修改措辞，新建记忆和 pending 还可修改归属，修改后重新校验并回到预览；
 4. 用户确认后才写入正式目录；
 5. 只提交本次计划内文件，然后上传。
 
-`category` 通常可省略：项目区按 type 自动归入 decisions/topics/incidents/handoffs，个人区 knowledge 按 type 归入 skills/experiences/learnings；单复数与大小写自动归一化。调整已入库记忆的措辞可提供 `edit=<仓库相对路径>` 原地更新（只改标题、描述、标签和正文，保留原 type/timestamp/scope/expires/supersedes）。
+**分类只由 `zone + type` 决定**：项目区传 `project + type`，不传 `category`；个人区 `layer` 可省略，knowledge 子目录也按 type 推导。`category` 仅向模型提供 Context 的 `current/relationships`。旧调用中匹配 type 的 category 仍兼容单复数、大小写和空白，规范化后移除；真正的类型/范围冲突明确拒绝，不为绕过错误擅自改成个人区。
 
-无 UI、离线或仓库有未处理修改时，候选只保存在本机 `pending/`，不会进入 Git。写入按顺序执行，并使用本机仓库锁防止多个 pi 进程互相覆盖。
+**TUI 审核**：完整预览独立滚动，Yes / No / Edit 固定显示，默认选中 No。↑↓ 或 1/2/3 选择，Enter 确认；PgUp/PgDn、Home/End 或鼠标滚轮查看内容，Esc 取消。过小窗口禁止批准，提示放大。新项目显著标明“新建项目”和记忆/辅助文件数量，README 与 INDEX 不冒充多条记忆。Edit → 修改归属可选择已有项目、新项目或个人区；跨区时由用户重新选择类型，旧项目附带文件不混入新计划。
+
+**RPC 审核**：不调用终端 custom 组件；先用短分页展示全部变更（可上一页），再显示三选项。明确选择 No/取消不会写入；关闭或超时保留 pending。未知 UI 或预览失败也只留待审核候选，不退回长标题确认、不默认批准。完整 diff 不再按 30000 字截断。
+
+调整已入库记忆的措辞可提供 `edit=<仓库相对路径>` 原地更新（只改标题、描述、标签和正文，保留原 type/timestamp/scope/expires/supersedes）；原地编辑不搬迁既有文件，无法审核/同步时停止并需重新发起，不生成用于新建的 pending。措辞编辑仍使用 Pi 终端编辑器，Ctrl+G 可调用外部编辑器。
+
+无 UI、离线或仓库有未处理修改时，候选只保存在本机 `pending/`，不会进入 Git。新建记忆和待审核候选在审核中已修改的正文与归属会在延迟写入时保留，不退回最初参数。写入按顺序执行，并使用本机仓库锁防止多个 pi 进程互相覆盖。
 
 ### `/memory` 命令
 
 ```text
-/memory status                    状态、数量和本地/远端差异
+/memory status                    运行版本/加载路径/磁盘指纹、记忆库状态
 /memory host                      查看本机角色
 /memory host set <角色>           设置/修改本机角色（仅本机）
 /memory sync                      完整同步；必要时只修复索引
@@ -98,7 +106,11 @@ pi update --extensions
 npm test
 ```
 
-测试先执行严格的 TypeScript 类型检查，再使用 `tests/fixtures/memory/` 中完全虚构的独立记忆库；不读取私人 `~/DEV/memory`。覆盖首次查找同步、项目隔离、待审核批准/拒绝、确认前编辑、原地编辑、敏感信息、路径越界、失败恢复、并发写入、远端竞态、归档、撤销、索引修复和基线/本机角色注入。GitHub 在每次推送和合并请求时自动运行同一套测试。
+测试先执行严格的 TypeScript 类型检查，再使用 `tests/fixtures/memory/` 中完全虚构的独立记忆库；不读取私人 `~/DEV/memory`。覆盖首次查找同步、项目隔离、待审核批准/拒绝、确认前编辑、原地编辑、敏感信息、路径越界、失败恢复、并发写入、远端竞态、归档、撤销、索引修复和基线/本机角色注入。
+
+分类测试经过真实 Pi wrapper → prepareArguments → schema 校验链；`tests/review_test.cjs` 使用真实 Pi 普通/全屏 overlay 合成器，覆盖长预览、中文宽字符、窗口缩放、固定按钮、键盘/取消、RPC 分页与版本漂移。完整工具流程还覆盖新项目批准/取消、Edit 改归属及失败后保留最新 pending。GitHub 对 Pi 0.85.1 / 0.87.1 运行同一套测试；这不替代各机实际终端或 RPC 客户端的人工验收。
+
+可用 `MEMARK_TEST_PI_ROOT=/实际安装的/pi-coding-agent npm test` 对另一已安装 Pi 的参数处理和渲染组件复测（类型检查仍用项目依赖）。
 
 ## 后续计划
 

@@ -6,13 +6,20 @@ const { execSync } = require("node:child_process");
 const { execFile } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
+const { pathToFileURL } = require("node:url");
+const { createRequire } = require("node:module");
 
 const G = process.env.PI_NODE_MODULES;
-const { createJiti } = require(path.join(G, "jiti"));
+const sdk = process.env.MEMARK_TEST_PI_ROOT || path.resolve(G, "..");
+const { createJiti } = createRequire(path.resolve(G, "../package.json"))("jiti");
+const sdkRequire = createRequire(path.join(sdk, "package.json"));
+const tuiEntry = sdkRequire.resolve("@earendil-works/pi-tui");
+const coreRoot = path.dirname(sdkRequire.resolve("@earendil-works/pi-agent-core/package.json"));
 const jiti = createJiti(__filename, {
 	alias: {
 		"@earendil-works/pi-ai": path.join(__dirname, "stub-pi-ai.cjs"),
 		"@earendil-works/pi-coding-agent": path.join(__dirname, "stub-pi-coding-agent.cjs"),
+		"@earendil-works/pi-tui": tuiEntry,
 	},
 });
 const mod = jiti(path.join(__dirname, "..", "index.ts"));
@@ -56,14 +63,22 @@ let confirmImpl = async () => true;
 let inputImpl = async () => "VPS";
 let inputCount = 0;
 let selectImpl = async () => "Yes";
+let editMenuImpl = async () => "修改措辞";
+let previewImpl = async (_title, options) => options[0];
 let editorImpl = async () => undefined;
+const previewTitles = [];
 const notes = [];
 const ctx = {
 	hasUI: true,
+	mode: "rpc",
 	ui: {
 		confirm: async (title, message) => confirmImpl(title, message),
 		input: async (title, placeholder) => { inputCount++; return inputImpl(title, placeholder); },
-		select: async (title, options) => selectImpl(title, options),
+		select: async (title, options) => {
+			if (title.startsWith("memark：预览 ")) { previewTitles.push(title); return previewImpl(title, options); }
+			if (title === "memark：编辑草案") return editMenuImpl(title, options);
+			return selectImpl(title, options);
+		},
 		editor: async (title, prefill) => editorImpl(title, prefill),
 		notify: (message) => {
 			notes.push(String(message));
@@ -84,7 +99,18 @@ const assert = (condition, message) => {
 };
 const toolText = (result) => result.content[0].text;
 const pendingFiles = () => fs.readdirSync(path.join(REPO, "pending")).filter((file) => file.endsWith(".md") && file !== "README.md");
-const remember = (params, context = ctx) => tools.memark_remember.execute("test", params, undefined, undefined, context);
+// 走真实 Pi 的 wrapper → prepareArguments → schema 校验，不再直接跳进 execute。
+const pipeline = Promise.all([
+	import(pathToFileURL(path.join(coreRoot, "dist/harness/execution/tools.js")).href),
+	import(pathToFileURL(path.join(sdk, "dist/core/tools/tool-definition-wrapper.js")).href),
+]);
+const remember = async (params, context = ctx, signal) => {
+	const [{ prepareToolCall }, { wrapToolDefinition }] = await pipeline;
+	const tool = wrapToolDefinition(tools.memark_remember, () => context);
+	const prepared = prepareToolCall({ id: "test", name: tool.name, arguments: params }, [tool]);
+	if (prepared.kind === "immediate") throw new Error(prepared.result.content[0].text);
+	return prepared.tool.execute("test", prepared.args, signal, undefined, context);
+};
 
 function addRemoteMemory() {
 	const other = path.join(BASE, "remote-writer");
@@ -299,7 +325,8 @@ function addRemoteMemory() {
 	selectImpl = async (title, options) => {
 		selectOptionsSeen = options;
 		checkedBeforeConfirm = !fs.existsSync(path.join(REPO, formalRel));
-		assert(title.includes(formalRel) && title.includes("+ status: active"), "确认窗口展示修改预览");
+		assert(previewTitles.join("\n").includes(formalRel) && previewTitles.join("\n").includes("+status: active"), "确认前已分页展示真实 diff");
+		assert(title.length < 80, "最终批准标题不携带长 diff");
 		return "Yes";
 	};
 	result = await remember({ title: "正式写入测试", description: "验证安全正式写入流程", body: "正式正文。", tags: ["测试"], zone: "project", project: "wiki", category: "topics", type: "Topic" });
@@ -322,8 +349,132 @@ function addRemoteMemory() {
 	assert(toolText(result).startsWith("✓") && fs.existsSync(path.join(REPO, "projects/wiki/decisions/自动归档决策.md")), "项目区省略 category 时按 type 自动归档");
 	result = await remember({ title: "自动归档技能", description: "省略 category 的 knowledge 写入", body: "技能正文。", tags: ["测试"], zone: "personal", layer: "knowledge", type: "Skill" });
 	assert(toolText(result).startsWith("✓") && fs.existsSync(path.join(REPO, "knowledge/skills/自动归档技能.md")), "个人区 knowledge 省略 category 时按 type 自动归档");
-	assert(tools.memark_remember.prepareArguments({ category: "Topic " }).category === "topics", "category 单复数与大小写自动归一化");
-	assert(tools.memark_remember.prepareArguments({ category: "Decisions" }).category === "decisions", "category 大写形式自动归一化");
+	const curatorMod = jiti(path.join(__dirname, "..", "curator.ts"));
+	assert(JSON.stringify(tools.memark_remember.parameters.properties.category.enum) === JSON.stringify(["current", "relationships"]), "模型 schema 不再混合个人区和项目区 category");
+	const categoryBase = { title: "分类兼容测试", description: "虚构分类测试", body: "分类测试正文。", tags: ["测试"], zone: "project", project: "wiki", as_pending: true };
+	for (const [type, category, directory] of [["Decision", "Decisions", "decisions"], ["Topic", "Topic ", "topics"], ["Incident", "INCIDENT", "incidents"], ["Handoff", "handoff", "handoffs"]]) {
+		const args = { ...categoryBase, type, category, ...(type === "Handoff" ? { expires: "2099-01-01" } : {}) };
+		const original = JSON.stringify(args);
+		const prepared = tools.memark_remember.prepareArguments(args);
+		assert(prepared.category === undefined && JSON.stringify(args) === original, `${type} 旧 category 兼容并移除冗余字段，不修改原参数`);
+		result = await remember(args);
+		assert(toolText(result).includes(`projects/wiki/${directory}/`), `${type} 经真实 wrapper/prepare/schema 链正确归档`);
+		fs.rmSync(path.join(REPO, "pending", pendingFiles()[0]));
+	}
+	assert(curatorMod.resolveTargetPath({ ...categoryBase, type: "Topic", category: "Topic " }).path.endsWith("topics/分类兼容测试.md"), "直接调用路径解析也使用同一归一化入口");
+	for (const [type, category, directory] of [["Skill", "SKILL", "skills"], ["Experience", "Experience ", "experiences"], ["Learning", "learnings", "learnings"]]) {
+		result = await remember({ title: "个人分类兼容", description: "测试个人类型推导", body: "测试。", tags: ["测试"], zone: "personal", type, category, as_pending: true });
+		assert(toolText(result).includes(`knowledge/${directory}/`), `${type} 不需要 layer/category 重复选择`);
+		fs.rmSync(path.join(REPO, "pending", pendingFiles()[0]));
+	}
+	result = await remember({ title: "关系分类兼容", description: "测试 Context", body: "关系测试。", tags: ["测试"], zone: "personal", type: "Context", category: "Relationship ", as_pending: true });
+	assert(toolText(result).includes("context/relationships/"), "Context 仍可选择关系分类");
+	fs.rmSync(path.join(REPO, "pending", pendingFiles()[0]));
+	for (const invalid of [
+		{ ...categoryBase, type: "Topic", category: "skills" },
+		{ ...categoryBase, type: "Decision", category: "topics" },
+		{ ...categoryBase, type: "Skill" },
+		{ ...categoryBase, type: "Topic", layer: "knowledge" },
+		{ ...categoryBase, zone: "personal", type: "Topic" },
+	]) {
+		let error;
+		try { await remember(invalid); } catch (err) { error = err; }
+		assert(error && error.message.includes("分类冲突"), "真正的范围/类型冲突被明确拒绝，不静默改区");
+	}
+	assert(pendingFiles().length === 0 && (await git(["status", "--porcelain"])).stdout.trim() === "", "非法分类不留下候选或正式改动");
+
+	// 5b-UI. 新项目多文件长预览：真实 ReviewPanel 渲染和按键经过工具的完整流程。
+	const { getKeybindings } = await import(pathToFileURL(tuiEntry).href);
+	const uiDraft = { title: "多文件长预览", description: "新项目界面回归", body: "长正文测试\n".repeat(6000) + "BODY_END_SENTINEL", tags: ["测试"], zone: "project", project: "ui-project", type: "Topic" };
+	const beforeUiHead = (await git(["rev-parse", "HEAD"])).stdout;
+	const tuiContext = (choice) => ({ ...ctx, mode: "tui", ui: { ...ctx.ui, custom: async (factory, options) => {
+		let chosen;
+		const component = await factory({ terminal: { rows: 24 }, requestRender() {} }, { fg: (_color, text) => text, bold: (text) => text }, getKeybindings(), (value) => { chosen = value; });
+		const lines = component.render(78);
+		assert(options.overlay && ["Yes", "No", "Edit"].every((option) => lines.some((line) => line.includes(option))), "新项目真实预览的三个操作始终可见");
+		assert(lines.join("").includes("新建项目") && lines.join("").includes("辅助文件"), "预览显著区分新项目和辅助文件");
+		assert(!fs.existsSync(path.join(REPO, "projects/ui-project")), "显示审核窗口时正式项目目录尚未创建");
+		component.handleInput("\x1b[F");
+		let tailVisible = false;
+		for (let page = 0; page < 8; page++) {
+			tailVisible ||= component.render(78).some((line) => line.includes("BODY_END_SENTINEL"));
+			component.handleInput("\x1b[5~");
+		}
+		assert(tailVisible, "真实多文件 diff 超过 30000 字仍完整可达");
+		component.handleInput(choice === "Yes" ? "1" : "2"); component.handleInput("\r"); component.dispose();
+		return chosen;
+	} } });
+	result = await remember(uiDraft, tuiContext("No"));
+	assert(toolText(result).includes("已取消") && !fs.existsSync(path.join(REPO, "projects/ui-project")), "No 不留下记忆、README、INDEX 或项目目录");
+	assert((await git(["rev-parse", "HEAD"])).stdout === beforeUiHead, "取消新项目不会产生提交");
+	result = await remember(uiDraft, tuiContext("Yes"));
+	assert(toolText(result).startsWith("✓"), "新项目长预览经真实按键批准后写入");
+	commitFiles = (await git(["show", "--name-only", "--format=", "HEAD"])).stdout.trim().split("\n");
+	assert(commitFiles.length === 3 && commitFiles.includes("projects/ui-project/README.md") && commitFiles.includes("projects/ui-project/INDEX.md"), "一条记忆与两个辅助文件位于同一精确提交");
+
+	const unsupported = { ...ctx, mode: "tui", ui: { ...ctx.ui, custom: undefined } };
+	result = await remember({ ...uiDraft, project: "unavailable-ui", title: "界面不可用候选", body: "仅待审核。" }, unsupported);
+	assert(toolText(result).includes("待审核候选") && !fs.existsSync(path.join(REPO, "projects/unavailable-ui")), "不支持安全 UI 时仅存 pending，不降级长标题确认");
+	fs.rmSync(path.join(REPO, "pending", pendingFiles()[0]));
+	const abort = new AbortController();
+	selectImpl = async () => { abort.abort(); return "Yes"; };
+	result = await remember({ ...categoryBase, type: "Topic", title: "中断保护测试", as_pending: false }, { ...ctx, signal: abort.signal }, abort.signal);
+	selectImpl = async () => "Yes";
+	assert(toolText(result).includes("已取消") && !fs.existsSync(path.join(REPO, "projects/wiki/topics/中断保护测试.md")), "审核中断后即使客户端返回 Yes 也不写入");
+	assert(!fs.existsSync(path.join(REPO, ".git/memark-write.lock")), "中断会释放仓库锁");
+	result = await remember({ ...categoryBase, type: "Topic", title: "RPC超时待审", as_pending: false }, { ...ctx, ui: { ...ctx.ui, select: async () => undefined } });
+	assert(toolText(result).includes("待审核候选") && !fs.existsSync(path.join(REPO, "projects/wiki/topics/RPC超时待审.md")), "RPC 关闭或超时保留 pending，不丢失草案或默认批准");
+	fs.rmSync(path.join(REPO, "pending", pendingFiles()[0]));
+	const previewFailureTools = {};
+	curatorMod.registerCurator({ ...pi,
+		registerTool: (definition) => { previewFailureTools[definition.name] = definition; },
+		exec: (cmd, args, opts) => cmd === "git" && args.includes("--no-index")
+			? Promise.resolve({ code: 1, killed: true, stdout: "@@ incomplete @@\n+ partial", stderr: "timeout" }) : exec(cmd, args, opts),
+	});
+	let unsafeReviewCalled = false;
+	result = await previewFailureTools.memark_remember.execute("diff-timeout", { ...categoryBase, type: "Topic", title: "预览失败待审", as_pending: false }, undefined, undefined,
+		{ ...ctx, ui: { ...ctx.ui, select: async () => { unsafeReviewCalled = true; return "Yes"; } } });
+	assert(!unsafeReviewCalled && toolText(result).includes("待审核候选"), "Git diff 超时产生的部分输出不得进入批准界面");
+	fs.rmSync(path.join(REPO, "pending", pendingFiles()[0]));
+
+	// 5b-route. 在同一审核流程修改归属；旧项目 scaffold 不能混入新预览和提交。
+	let routeStep = 0;
+	editMenuImpl = async () => "修改归属";
+	selectImpl = async (title) => {
+		if (title === "memark：适用范围") return "个人区（跨项目）";
+		if (title === "memark：选择新范围下的记忆类型") return "Principle";
+		return routeStep++ === 0 ? "Edit" : "Yes";
+	};
+	result = await remember({ ...categoryBase, project: "discarded-project", type: "Topic", title: "归属调整测试", as_pending: false });
+	editMenuImpl = async () => "修改措辞";
+	selectImpl = async () => "Yes";
+	assert(toolText(result).includes("principles/归属调整测试.md") && !fs.existsSync(path.join(REPO, "projects/discarded-project")), "用户改归个人区后只提交新计划，不残留原项目");
+	const relocated = fs.readFileSync(path.join(REPO, "principles/归属调整测试.md"), "utf8");
+	assert(relocated.includes("type: Principle") && !relocated.includes("scope: project"), "跨区类型由用户重选，scope 同步调整");
+	assert((await git(["log", "-1", "--format=%s"])).stdout.includes("memory: principles/归属调整测试.md"), "审计提交使用最终批准的目标路径");
+
+	// 编辑/调整归属后同步或工作区变化，pending 必须保留最后审核草案，而非旧参数。
+	const lateDirtyFile = path.join(REPO, "principles/清理前先备份.md");
+	routeStep = 0;
+	let editMenuStep = 0;
+	editMenuImpl = async () => editMenuStep++ === 0 ? "修改措辞" : "修改归属";
+	editorImpl = async (_title, text) => text.replace("分类测试正文。", "已经由用户调整的新正文。");
+	selectImpl = async (title) => {
+		if (title === "memark：适用范围") return "个人区（跨项目）";
+		if (title === "memark：选择新范围下的记忆类型") return "Principle";
+		if (routeStep++ < 2) return "Edit";
+		fs.appendFileSync(lateDirtyFile, "\nLATE_DIRTY_FIXTURE\n");
+		return "Yes";
+	};
+	result = await remember({ ...categoryBase, project: "deferred-project", type: "Topic", title: "归属调整待审测试", description: "编辑后变化的候选恢复测试", as_pending: false });
+	selectImpl = async () => "Yes"; editMenuImpl = async () => "修改措辞"; editorImpl = async () => undefined;
+	pending = pendingFiles()[0];
+	pendingText = fs.readFileSync(path.join(REPO, "pending", pending), "utf8");
+	assert(toolText(result).includes("待审核候选") && pendingText.includes("target: principles/归属调整待审测试.md") && pendingText.includes("已经由用户调整的新正文"), "降级 pending 保留修改后的正文、类型与目标");
+	assert(!fs.existsSync(path.join(REPO, "projects/deferred-project")) && pendingText.includes("reviewed: false"), "降级不创建旧项目或伪装已批准");
+	await git(["restore", "--", "principles/清理前先备份.md"]);
+	await commands.memory.handler(`approve ${pending.replace(/\.md$/, "")}`, ctx);
+	assert(fs.existsSync(path.join(REPO, "principles/归属调整待审测试.md")) && pendingFiles().length === 0, "变更后的 pending 可再次完整审核并批准");
 
 	// 5c. Edit 选项：编辑后写入；Esc 返回预览；破坏格式时提示并不写入。
 	let editStep = 0;
@@ -347,7 +498,7 @@ function addRemoteMemory() {
 	result = await remember({ title: "编辑失败测试", description: "验证校验失败的编辑", body: "失败正文。", tags: ["测试"], zone: "personal", layer: "principles", type: "Principle" });
 	selectImpl = async () => "Yes";
 	editorImpl = async () => undefined;
-	assert(editTitles.some((title) => title.includes("编辑未通过")), "破坏格式的编辑在预览中提示错误");
+	assert(previewTitles.some((title) => title.includes("编辑未通过")), "破坏格式的编辑在预览中提示错误");
 	assert(!fs.existsSync(path.join(REPO, "principles/编辑失败测试.md")), "校验失败的编辑不会写入");
 
 	// 5d. /memory edit 与 memark_remember edit 参数：原地修改措辞。
@@ -388,6 +539,21 @@ function addRemoteMemory() {
 	selectImpl = async () => "Yes";
 	editorImpl = async () => undefined;
 	assert(fs.readFileSync(path.join(REPO, "principles/批准编辑测试.md"), "utf8").includes("批准时编辑正文。"), "approve 支持批准前编辑措辞");
+	await remember({ title: "批准延迟保留草案", description: "批准流程延迟的草案保护", body: "延迟前正文。", tags: ["测试"], zone: "personal", type: "Principle", as_pending: true });
+	pending = pendingFiles()[0]; approveStep = 0;
+	selectImpl = async () => {
+		if (approveStep++ === 0) return "Edit";
+		fs.appendFileSync(lateDirtyFile, "\nAPPROVE_DIRTY_FIXTURE\n");
+		return "Yes";
+	};
+	editorImpl = async (_title, prefill) => String(prefill).replace("延迟前正文。", "用户编辑后待审正文。").replace(/\r?\n/g, "\r\n");
+	await commands.memory.handler(`approve ${pending.replace(/\.md$/, "")}`, ctx);
+	selectImpl = async () => "Yes"; editorImpl = async () => undefined;
+	pendingText = fs.readFileSync(path.join(REPO, "pending", pending), "utf8");
+	assert(pendingText.includes("target: principles/批准延迟保留草案.md") && pendingText.includes("用户编辑后待审正文") && !fs.existsSync(path.join(REPO, "principles/批准延迟保留草案.md")), "approve 延迟时更新原 pending，CRLF 草案也保留 target 和最新措辞");
+	await git(["restore", "--", "principles/清理前先备份.md"]);
+	await commands.memory.handler(`approve ${pending.replace(/\.md$/, "")}`, ctx);
+	assert(pendingFiles().length === 0, "延迟草案恢复后可重新批准");
 
 	// 7. supersedes 同 commit 更新旧状态。
 	result = await remember({ title: "最小改动原则新版", description: "取代旧版最小改动原则", body: "使用新版原则。", tags: ["测试"], zone: "personal", layer: "principles", type: "Principle", supersedes: "principles/能不动就不动.md" });
@@ -410,7 +576,7 @@ function addRemoteMemory() {
 	result = await remember({ title: "远端竞态保护测试", description: "远端变化时不使用旧预览提交", body: "应降级待审。", tags: ["测试"], zone: "personal", layer: "principles", type: "Principle" });
 	selectImpl = async () => "Yes";
 	assert(!fs.existsSync(path.join(REPO, "principles/远端竞态保护测试.md")), "确认期间远端变化时不写入旧草案");
-	assert(toolText(result).includes("候选保留") && pendingFiles().length === 1, "远端变化时降级保存 pending");
+	assert(toolText(result).includes("待审核候选") && pendingFiles().length === 1, "远端变化时降级保存 pending");
 	fs.rmSync(path.join(REPO, "pending", pendingFiles()[0]));
 
 	// 8. 仓库已有手工修改时停止，不删除修改，并把新请求降级为 pending。
