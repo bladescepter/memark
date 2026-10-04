@@ -15,6 +15,7 @@ import {
 	readFileSync,
 	readdirSync,
 	rmSync,
+	rmdirSync,
 	writeFileSync,
 } from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -22,6 +23,8 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { runtime } from "./diagnostics";
 import { showReview, type ReviewContext } from "./review-ui";
+import { parseMetadata, parseSimpleFrontmatter, rewriteMemory, validDate } from "./metadata";
+export { parseSimpleFrontmatter } from "./metadata";
 import {
 	filenameFromTitle,
 	git,
@@ -35,6 +38,7 @@ import {
 	restoreSnapshots,
 	runRepoScript,
 	snapshotFiles,
+	snapshotsMatch,
 	unsafeWorktreeChanges,
 	withRepoMutation,
 	worktreeChanges,
@@ -83,7 +87,6 @@ const CATEGORY_ALIASES: Record<string, string> = {
 	learning: "learnings",
 	learnings: "learnings",
 };
-const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const WRITE_TIMEOUT_MS = 30_000;
 
 export interface Draft {
@@ -117,12 +120,6 @@ type Changes = Map<string, string | null>;
 
 function today(): string {
 	return new Date().toISOString().slice(0, 10);
-}
-
-function validDate(value: string): boolean {
-	if (!DATE_RE.test(value)) return false;
-	const parsed = new Date(`${value}T00:00:00Z`);
-	return !Number.isNaN(parsed.valueOf()) && parsed.toISOString().slice(0, 10) === value;
 }
 
 function scalar(value: string): string {
@@ -262,41 +259,7 @@ function buildPendingFile(d: Draft | string, target: string): string {
 }
 
 function pendingToFormal(text: string): string {
-	const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---([\s\S]*)$/);
-	if (!match) throw new Error("pending 文件缺少合法 frontmatter");
-	const frontmatter = match[1]
-		.split(/\r?\n/)
-		.filter((line) => !/^target:\s*/.test(line))
-		.map((line) => {
-			if (/^status:\s*/.test(line)) return "status: active";
-			if (/^source:\s*/.test(line)) return "source: user-confirmed";
-			if (/^reviewed:\s*/.test(line)) return "reviewed: true";
-			return line;
-		})
-		.join("\n");
-	return `---\n${frontmatter}\n---${match[2]}`;
-}
-
-/** 极简 frontmatter 解析（仅用于受控 pending 文件与展示）。 */
-export function parseSimpleFrontmatter(text: string): Record<string, string> {
-	const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---/);
-	if (!match) return {};
-	const out: Record<string, string> = {};
-	for (const line of match[1].split(/\r?\n/)) {
-		const i = line.indexOf(":");
-		if (i <= 0) continue;
-		const key = line.slice(0, i).trim();
-		let value = line.slice(i + 1).trim();
-		if (value.startsWith('"') && value.endsWith('"')) {
-			try {
-				value = JSON.parse(value);
-			} catch {
-				// 保留原值，后续仓库校验会拒绝非法格式。
-			}
-		}
-		out[key] = String(value);
-	}
-	return out;
+	return rewriteMemory(text, { target: null, status: "active", source: "user-confirmed", reviewed: "true" });
 }
 
 export function parseMemoryArgs(args: string): { cmd: string; rest: string[] } {
@@ -405,6 +368,12 @@ function applyChanges(root: string, changes: Changes): void {
 		const abs = join(root, ...rel.split("/"));
 		if (content === null) {
 			rmSync(abs, { force: true });
+			// 删除项目最后一组文件时也去掉空父目录；临时副本和正式仓库同样处理。
+			for (let dir = dirname(abs); dir !== root; dir = dirname(dir)) {
+				if (!existsSync(dir)) continue;
+				if (readdirSync(dir).length > 0) break;
+				rmdirSync(dir);
+			}
 			continue;
 		}
 		mkdirSync(dirname(abs), { recursive: true });
@@ -449,13 +418,13 @@ async function prepareChanges(pi: ExtensionAPI, requested: Changes): Promise<Cha
 }
 
 /** 使用 Git 的完整 unified diff；不按字符数截断，也不丢失重复行/顺序变化。 */
-async function changePreview(pi: ExtensionAPI, changes: Changes): Promise<string> {
+async function changePreview(pi: ExtensionAPI, changes: Changes, snapshots: ReturnType<typeof snapshotFiles>): Promise<string> {
 	const temp = mkdtempSync(join(tmpdir(), "memark-preview-"));
 	try {
 		const sections: string[] = [];
 		for (const [rel, after] of changes) {
-			const abs = resolveRepoPath(rel).abs;
-			const before = existsSync(abs) ? readFileSync(abs, "utf8") : null;
+			const snapshot = snapshots.find((item) => item.rel === rel)!;
+			const before = snapshot.existed ? snapshot.content!.toString("utf8") : null;
 			writeFileSync(join(temp, "before"), before ?? "", { mode: 0o600 });
 			writeFileSync(join(temp, "after"), after ?? "", { mode: 0o600 });
 			const diff = await pi.exec("git", ["diff", "--no-index", "--no-ext-diff", "--no-textconv", "--no-color", "--text", "--", join(temp, "before"), join(temp, "after")], { timeout: WRITE_TIMEOUT_MS });
@@ -481,7 +450,8 @@ function changeSummary(changes: Changes, primary?: string): string {
 
 async function rollbackExact(pi: ExtensionAPI, snapshots: ReturnType<typeof snapshotFiles>): Promise<void> {
 	const paths = snapshots.map((snapshot) => snapshot.rel);
-	await git(pi, ["reset", "--quiet", "HEAD", "--", ...paths]);
+	const reset = await git(pi, ["reset", "--quiet", "HEAD", "--", ...paths]);
+	if (reset.code !== 0) throw new Error(`无法恢复暂存区，请人工处理：${reset.stderr || reset.stdout}`);
 	restoreSnapshots(snapshots);
 }
 
@@ -514,6 +484,7 @@ async function commitPreparedChanges(
 	confirmTitle: string,
 	commitSubject: string | (() => string),
 	editable?: EditableDraft,
+	pendingSource?: { rel: string; text: string },
 ): Promise<WriteResult> {
 	let prepared: Changes;
 	try {
@@ -530,14 +501,16 @@ async function commitPreparedChanges(
 	const editor = ctx.hasUI ? ctx.ui.editor : undefined;
 	const canEdit = Boolean(editor && editable);
 	let banner = "";
+	let reviewedSnapshots: ReturnType<typeof snapshotFiles> = [];
 	while (true) {
 		if (ctx.signal?.aborted) return { success: false, text: "已取消，正式仓库未改动。" };
 		let choice: string;
 		try {
+			reviewedSnapshots = snapshotFiles([...prepared.keys()]);
 			choice = await showReview(ctx, {
 				title: confirmTitle,
 				summary: changeSummary(prepared, editable?.rel),
-				text: banner + await changePreview(pi, prepared),
+				text: banner + await changePreview(pi, prepared, reviewedSnapshots),
 				canEdit,
 			});
 		} catch (err) {
@@ -589,9 +562,16 @@ async function commitPreparedChanges(
 	}
 
 	const paths = [...prepared.keys()];
-	return withFileQueues(paths, async () => {
+	return withFileQueues(pendingSource ? [...paths, pendingSource.rel] : paths, async () => {
 		if (ctx.signal?.aborted) return { success: false, text: "已取消，正式仓库未改动。" };
-		const snapshots = snapshotFiles(paths);
+		if (pendingSource && !pendingMatches(pendingSource)) return { success: false, text: "候选在审核期间已变化或被拒绝，已停止；请重新审核当前 pending。" };
+		// 排队获取文件锁也可能等待其他 edit/write，故原来的锁前检查不能作为最终依据。
+		const lockedHead = await git(pi, ["rev-parse", "HEAD"]);
+		const lateDirty = await unsafeWorktreeChanges(pi);
+		if (lockedHead.code !== 0 || lockedHead.stdout.trim() !== baseHead || lateDirty.length || !snapshotsMatch(reviewedSnapshots)) {
+			return defer("取得文件锁后发现仓库或原文已变化，未覆盖；请重新审核。");
+		}
+		const snapshots = reviewedSnapshots;
 		let committed = false;
 		try {
 			applyChanges(REPO, prepared);
@@ -603,8 +583,10 @@ async function commitPreparedChanges(
 			const unexpected = [...actual].filter((path) => !allowed.has(path) && !path.startsWith("pending/"));
 			if (unexpected.length > 0) throw new Error(`出现计划外修改：${unexpected.join(", ")}`);
 
-			await git(pi, ["add", "-A", "--", ...paths]);
+			const added = await git(pi, ["add", "-A", "--", ...paths]);
+			if (added.code !== 0) throw new Error(`暂存失败：${added.stderr || added.stdout}`);
 			const stagedResult = await git(pi, ["diff", "--cached", "--name-only", "-z"]);
+			if (stagedResult.code !== 0) throw new Error(`无法检查暂存区：${stagedResult.stderr || stagedResult.stdout}`);
 			const staged = stagedResult.stdout.split("\0").filter(Boolean).map((path) => path.replace(/\\/g, "/"));
 			const stagedUnexpected = staged.filter((path) => !allowed.has(path));
 			if (stagedUnexpected.length > 0) throw new Error(`暂存区含计划外文件：${stagedUnexpected.join(", ")}`);
@@ -675,8 +657,8 @@ async function buildWriteChanges(rel: string, content: string): Promise<Changes 
 	const oldPath = resolveRepoPath(oldRel).abs;
 	if (!existsSync(oldPath)) return `✗ supersedes 目标不存在：${oldRel}`;
 	const oldText = readFileSync(oldPath, "utf8");
-	if (!/^status: active$/m.test(oldText)) return `✗ 只能取代 active 记忆：${oldRel}`;
-	changes.set(oldRel, oldText.replace(/^status: active$/m, "status: superseded"));
+	if (parseMetadata(oldText)?.status !== "active") return `✗ 只能取代 active 记忆：${oldRel}`;
+	changes.set(oldRel, rewriteMemory(oldText, { status: "superseded" }));
 	return changes;
 }
 
@@ -736,12 +718,18 @@ async function chooseLocation(ctx: Ctx, content: string): Promise<{ rel: string;
 	return { rel: target.path, content: `---\n${fields.join("\n")}\n---${match[2]}` };
 }
 
+function pendingMatches(source: { rel: string; text: string }): boolean {
+	const file = resolveRepoPath(source.rel).abs;
+	return existsSync(file) && readFileSync(file, "utf8") === source.text;
+}
+
 async function writeFormal(
 	pi: ExtensionAPI,
 	ctx: Ctx,
 	relInput: string,
 	content: string,
 	commitNote = "",
+	pendingSource?: { rel: string; text: string },
 ): Promise<WriteResult> {
 	return withRepoMutation(async () => {
 		const rel = resolveRepoPath(relInput).rel;
@@ -763,30 +751,19 @@ async function writeFormal(
 			},
 		};
 		const result = await commitPreparedChanges(pi, ctx, first, ready.head!, "memark：确认以下修改？",
-			() => `memory: ${editable.rel}${commitNote ? ` (${commitNote})` : ""}`, editable);
+			() => `memory: ${editable.rel}${commitNote ? ` (${commitNote})` : ""}`, editable, pendingSource);
 		if (result.success) result.text = `${result.text}\n${editable.rel}`;
 		return result;
-	});
+	}, { signal: ctx.signal });
 }
 
 /** 用新措辞重建记忆文件；frontmatter 其余字段沿用原值。 */
-function buildEditedFile(d: Draft, fm: Record<string, string>): string {
+function buildEditedFile(d: Draft, original: string): string {
 	validateDraft(d);
-	const lines = [
-		"---",
-		`type: ${d.type}`,
-		`title: ${scalar(d.title.trim())}`,
-		`description: ${scalar(d.description.trim())}`,
-		`status: ${fm.status ?? "active"}`,
-		`privacy: ${fm.privacy ?? "internal"}`,
-		`tags: [${d.tags.map((tag) => scalar(tag.trim())).join(", ")}]`,
-		`timestamp: ${d.timestamp ?? today()}`,
-	];
-	if (fm.scope) lines.push(`scope: ${fm.scope}`);
-	if (d.expires) lines.push(`expires: ${d.expires}`);
-	if (fm.supersedes) lines.push(`supersedes: ${fm.supersedes}`);
-	lines.push(`source: ${fm.source ?? "user-confirmed"}`, `reviewed: ${fm.reviewed ?? "true"}`, "---", "", d.body.trim(), "");
-	return lines.join("\n");
+	return rewriteMemory(original, {
+		title: scalar(d.title.trim()), description: scalar(d.description.trim()),
+		tags: `[${d.tags.map((tag) => scalar(tag.trim())).join(", ")}]`,
+	}, `\n${d.body.trim()}\n`);
 }
 
 /** 由模型改写已有记忆的措辞：只更新标题、描述、标签和正文，其余 frontmatter 沿用原值。 */
@@ -799,7 +776,7 @@ async function writeEdited(pi: ExtensionAPI, ctx: Ctx, relInput: string, d: Draf
 		const source = resolveRepoPath(rel).abs;
 		if (!existsSync(source)) return { success: false, text: `✗ 待编辑记忆不存在：${rel}` };
 		const original = readFileSync(source, "utf8");
-		if (!/^status: active$/m.test(original)) return { success: false, text: `✗ 只能编辑 status: active 的记忆：${rel}` };
+		if (parseMetadata(original)?.status !== "active") return { success: false, text: `✗ 只能编辑 status: active 的记忆：${rel}` };
 		const fm = parseSimpleFrontmatter(original);
 		const effective: Draft = {
 			...d,
@@ -810,7 +787,7 @@ async function writeEdited(pi: ExtensionAPI, ctx: Ctx, relInput: string, d: Draf
 		};
 		let content: string;
 		try {
-			content = buildEditedFile(effective, fm);
+			content = buildEditedFile(effective, original);
 		} catch (err) {
 			return { success: false, text: `✗ 编辑草案未通过校验：${(err as Error).message}` };
 		}
@@ -821,7 +798,7 @@ async function writeEdited(pi: ExtensionAPI, ctx: Ctx, relInput: string, d: Draf
 		});
 		if (result.success) result.text = `${result.text}\n${rel}`;
 		return result;
-	});
+	}, { signal: ctx.signal });
 }
 
 export function registerCurator(pi: ExtensionAPI): void {
@@ -968,13 +945,42 @@ function expiredMemories(): string[] {
 		if (!match) continue;
 		try {
 			const text = readFileSync(resolveRepoPath(match[1]).abs, "utf8");
-			const expiry = text.match(/^expires:\s*(\d{4}-\d{2}-\d{2})$/m)?.[1];
-			if (expiry && expiry < todayValue) expired.push(match[1]);
+			const fields = parseMetadata(text);
+			const expiry = fields?.expires;
+			if (fields?.status === "active" && validDate(expiry) && expiry < todayValue) expired.push(match[1]);
 		} catch {
 			// maintain 会由仓库校验报告缺失文件。
 		}
 	}
 	return expired;
+}
+
+async function revisionFile(pi: ExtensionAPI, revision: string, rel: string): Promise<string | null> {
+	const listed = await git(pi, ["ls-tree", "-r", "--name-only", "-z", revision, "--", rel]);
+	if (listed.code !== 0) throw new Error(`无法读取撤销基准：${listed.stderr || listed.stdout}`);
+	if (!listed.stdout.split("\0").includes(rel)) return null;
+	const file = await git(pi, ["show", `${revision}:${rel}`]);
+	if (file.code !== 0) throw new Error(`无法读取历史文件：${file.stderr || file.stdout}`);
+	return file.stdout;
+}
+
+/** 只反转记忆事务；非索引文件若被后续提交改变，则拒绝猜测合并。索引交给协议重建。 */
+async function revertChanges(pi: ExtensionAPI, hash: string): Promise<Changes> {
+	const changed = await git(pi, ["diff-tree", "--no-commit-id", "--name-only", "--no-renames", "-r", "-z", hash]);
+	if (changed.code !== 0) throw new Error(`无法读取撤销清单：${changed.stderr || changed.stdout}`);
+	const changes: Changes = new Map();
+	for (const path of changed.stdout.split("\0").filter(Boolean)) {
+		const rel = resolveRepoPath(path).rel;
+		const index = rel === "INDEX.md" || /^projects\/[^/]+\/INDEX\.md$/.test(rel);
+		const managed = isFormalMemoryPath(rel) || (rel.startsWith("archive/") && isFormalMemoryPath(rel.slice(8))) || /^projects\/[^/]+\/README\.md$/.test(rel);
+		if (!index && !managed) throw new Error(`该提交包含非记忆文件，拒绝自动撤销：${rel}`);
+		if (!index && await revisionFile(pi, "HEAD", rel) !== await revisionFile(pi, hash, rel)) {
+			throw new Error(`后续提交已修改 ${rel}，请人工处理撤销`);
+		}
+		changes.set(rel, await revisionFile(pi, `${hash}^`, rel));
+	}
+	if (changes.size === 0) throw new Error("没有可撤销的文件");
+	return changes;
 }
 
 /** /memory 命令族入口。 */
@@ -1057,7 +1063,8 @@ export async function handleMemoryCommand(pi: ExtensionAPI, args: string, ctx: C
 			return;
 		}
 
-		const text = readFileSync(file, "utf8");
+		const text = await withFileMutationQueue(file, async () => readFileSync(file, "utf8"));
+		const source = { rel: `pending/${id}.md`, text };
 		const fm = parseSimpleFrontmatter(text);
 		if (!fm.target) {
 			notify(`pending/${id}.md 缺少 target 字段。`, "error");
@@ -1065,18 +1072,21 @@ export async function handleMemoryCommand(pi: ExtensionAPI, args: string, ctx: C
 		}
 		let result: WriteResult;
 		try {
-			result = await writeFormal(pi, ctx, fm.target, pendingToFormal(text), id);
+			result = await writeFormal(pi, ctx, fm.target, pendingToFormal(text), id, source);
 		} catch (err) {
 			notify(`批准失败：${(err as Error).message}`, "error");
 			return;
 		}
-		if (result.success) await withFileMutationQueue(file, async () => rmSync(file));
+		if (result.success) await withFileMutationQueue(file, async () => {
+			if (pendingMatches(source)) rmSync(file);
+			else result.text += "\n⚠ pending 已有新版本，已保留；本次仅提交了审核过的版本。";
+		});
 		else if (result.deferred && result.candidate && !ctx.signal?.aborted) {
 			const latest = buildPendingFile(result.candidate.content, result.candidate.rel);
 			const error = await scanCandidate(pi, latest);
 			if (error) throw new Error(`编辑后的候选未保存：${error}`);
 			await withFileMutationQueue(file, async () => {
-				if (readFileSync(file, "utf8") !== text) throw new Error("pending 在审核期间已变化，未覆盖");
+				if (!pendingMatches(source)) throw new Error("pending 在审核期间已变化或被拒绝，未覆盖");
 				writeFileSync(file, latest, { mode: 0o600 });
 			});
 		}
@@ -1100,12 +1110,12 @@ export async function handleMemoryCommand(pi: ExtensionAPI, args: string, ctx: C
 				const source = resolveRepoPath(rel).abs;
 				if (!existsSync(source)) return { success: false, text: `文件不存在：${rel}` };
 				const original = readFileSync(source, "utf8");
-				if (!/^status: active$/m.test(original)) return { success: false, text: "只能归档 status: active 的记忆" };
+				if (parseMetadata(original)?.status !== "active") return { success: false, text: "只能归档 status: active 的记忆" };
 				const destination = resolveRepoPath(`archive/${rel}`).rel;
 				if (existsSync(resolveRepoPath(destination).abs)) return { success: false, text: `归档目标已存在：${destination}` };
 				const changes: Changes = new Map([
 					[rel, null],
-					[destination, original.replace(/^status: active$/m, "status: archived")],
+					[destination, rewriteMemory(original, { status: "archived" })],
 				]);
 				return commitPreparedChanges(pi, ctx, changes, ready.head!, "memark：确认归档以下记忆？", `memory: archive ${rel}`);
 			});
@@ -1211,46 +1221,13 @@ export async function handleMemoryCommand(pi: ExtensionAPI, args: string, ctx: C
 					notify(blocked ? `最近存在非记忆提交（${blocked}），拒绝跨越它自动撤销。` : "没有可安全撤销的记忆提交。", "warning");
 					return;
 				}
-				const stat = (await git(pi, ["show", "--stat", "--oneline", "--no-renames", target.hash])).stdout.trim();
-				const ok = ctx.hasUI && await showReview(ctx, {
-					title: "memark：确认撤销这次记忆修改？", summary: target.subject, text: stat, canEdit: false,
-				}) === "Yes" && !ctx.signal?.aborted;
-				if (!ok) {
-					notify("已取消。", "info");
-					return;
-				}
-				const confirmPull = await git(pi, ["pull", "--ff-only", "--quiet"], { timeout: WRITE_TIMEOUT_MS });
-				if (confirmPull.code !== 0) {
-					notify(`确认期间同步失败，已停止撤销：${(confirmPull.stderr || confirmPull.stdout).trim()}`, "error");
-					return;
-				}
-				const confirmedHead = (await git(pi, ["rev-parse", "HEAD"])).stdout.trim();
-				if (confirmedHead !== baseHead) {
-					notify("确认期间远端记忆发生变化，已停止撤销；请重新执行 /memory revert。", "warning");
-					return;
-				}
-				const pathResult = await git(pi, ["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", target.hash]);
-				if (pathResult.code !== 0) {
-					notify(`无法读取待撤销文件清单：${(pathResult.stderr || pathResult.stdout).trim()}`, "error");
-					return;
-				}
-				const paths = pathResult.stdout.split("\0").filter(Boolean).map((path) => path.replace(/\\/g, "/"));
-				await withFileQueues(paths, async () => {
-					const lateDirty = await unsafeWorktreeChanges(pi);
-					if (lateDirty.length > 0) {
-						notify(`确认期间仓库出现修改，已停止撤销：${lateDirty.map((item) => item.path).join(", ")}`, "error");
-						return;
-					}
-					const revert = await git(pi, ["revert", "--no-edit", target.hash], { timeout: WRITE_TIMEOUT_MS });
-					if (revert.code !== 0) {
-						await git(pi, ["revert", "--abort"]);
-						notify(`撤销失败，已清理中间状态：${(revert.stderr || revert.stdout).trim()}`, "error");
-						return;
-					}
-					const push = await git(pi, ["push"], { timeout: WRITE_TIMEOUT_MS });
-					notify(`✓ 已撤销：${target.subject}${push.code === 0 ? "，并已上传" : "；上传失败，撤销记录保留在本地"}`, push.code === 0 ? "info" : "warning");
-				});
-			});
+				const errors = await runReadOnlyChecks(pi);
+				if (errors) throw new Error(`当前仓库校验失败：${errors}`);
+				const changes = await revertChanges(pi, target.hash);
+				const result = await commitPreparedChanges(pi, ctx, changes, baseHead,
+					"memark：确认撤销这次记忆修改？", `Revert "${target.subject}"\n\nThis reverts commit ${target.hash}.`);
+				notify(result.success ? `已撤销：${target.subject}\n${result.text}` : result.text, result.success ? "info" : "warning");
+			}, { signal: ctx.signal });
 		} catch (err) {
 			notify(`撤销失败：${(err as Error).message}`, "error");
 		}

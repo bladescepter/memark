@@ -3,6 +3,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { platform } from "node:os";
 import { readIndex, resolveRepoPath } from "./repo";
 import { normalizeHostRole, readHostRole } from "./host-role";
+import { currentMemory, parseMetadata } from "./metadata";
 
 const MAX_CHARS = 480;
 const MAX_BYTES = 1100;
@@ -49,27 +50,11 @@ export function hostContext(facts: HostFacts): string {
 	].join("\n");
 }
 
-function scalar(raw: string | undefined): string | null {
-	if (!raw) return null;
-	try {
-		const value: unknown = raw.startsWith('"') ? JSON.parse(raw) : raw;
-		return typeof value === "string" ? value : null;
-	} catch {
-		return null;
-	}
-}
-
 function reviewedSummary(text: string, layer: Layer): string | null {
-	const front = text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)?.[1];
-	if (!front) return null;
-	const field = (key: string) => front.match(new RegExp(`^${key}:\\s*(.*)$`, "m"))?.[1]?.trim();
-	if (field("type") !== TYPES[layer] || field("status") !== "active" || field("reviewed") !== "true") return null;
-	if (field("scope") === "project" || !["internal", "public"].includes(field("privacy") ?? "")) return null;
-	const expiry = field("expires");
-	if (expiry && expiry !== "null" && expiry <= new Date().toISOString().slice(0, 10)) return null;
-	const title = scalar(field("title"));
-	const description = scalar(field("description"));
-	if (!title || !description) return null;
+	const fields = parseMetadata(text);
+	if (!fields || !currentMemory(fields) || fields.type !== TYPES[layer] || fields.scope === "project") return null;
+	const { title, description } = fields;
+	if (typeof title !== "string" || typeof description !== "string") return null;
 	const summary = `${title}：${description}`;
 	if (Array.from(summary).length > MAX_ITEM_CHARS || /[\p{Cc}\p{Cf}\u2028\u2029]/u.test(summary)) return null;
 	return summary;

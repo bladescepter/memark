@@ -83,7 +83,12 @@ def validate_layout(root: Path) -> list[str]:
 def validate_links(root: Path) -> list[str]:
     errors: list[str] = []
     for path in sorted(root.rglob("*.md")):
-        if ".git" in path.parts or path.is_symlink():
+        rel = path.relative_to(root)
+        if ".git" in rel.parts or path.is_symlink():
+            continue
+        # 本机候选的链接须在批准时按正式目标路径检查，不能阻断无关正式写入。
+        # pending/README.md 仍属于受版本管理的协议文档，不能跳过。
+        if rel.parts[0] == "pending" and rel.parts != ("pending", "README.md"):
             continue
         try:
             text = path.read_text(encoding="utf-8")

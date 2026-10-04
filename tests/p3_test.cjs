@@ -64,7 +64,6 @@ let inputImpl = async () => "VPS";
 let inputCount = 0;
 let selectImpl = async () => "Yes";
 let editMenuImpl = async () => "修改措辞";
-let previewImpl = async (_title, options) => options[0];
 let editorImpl = async () => undefined;
 const previewTitles = [];
 const notes = [];
@@ -75,11 +74,13 @@ const ctx = {
 		confirm: async (title, message) => confirmImpl(title, message),
 		input: async (title, placeholder) => { inputCount++; return inputImpl(title, placeholder); },
 		select: async (title, options) => {
-			if (title.startsWith("memark：预览 ")) { previewTitles.push(title); return previewImpl(title, options); }
 			if (title === "memark：编辑草案") return editMenuImpl(title, options);
 			return selectImpl(title, options);
 		},
-		editor: async (title, prefill) => editorImpl(title, prefill),
+		editor: async (title, prefill) => {
+			if (title.startsWith("memark：完整变更预览")) { previewTitles.push(prefill); return prefill; }
+			return editorImpl(title, prefill);
+		},
 		notify: (message) => {
 			notes.push(String(message));
 			console.log(`  [notify] ${String(message).split("\n")[0]}`);
@@ -325,14 +326,14 @@ function addRemoteMemory() {
 	selectImpl = async (title, options) => {
 		selectOptionsSeen = options;
 		checkedBeforeConfirm = !fs.existsSync(path.join(REPO, formalRel));
-		assert(previewTitles.join("\n").includes(formalRel) && previewTitles.join("\n").includes("+status: active"), "确认前已分页展示真实 diff");
+		assert(previewTitles.join("\n").includes(formalRel) && previewTitles.join("\n").includes("+status: active"), "确认前已一次展示完整真实 diff");
 		assert(title.length < 80, "最终批准标题不携带长 diff");
 		return "Yes";
 	};
 	result = await remember({ title: "正式写入测试", description: "验证安全正式写入流程", body: "正式正文。", tags: ["测试"], zone: "project", project: "wiki", category: "topics", type: "Topic" });
 	selectImpl = async () => "Yes";
 	assert(checkedBeforeConfirm, "用户确认前正式目录没有草案");
-	assert(JSON.stringify(selectOptionsSeen) === JSON.stringify(["Yes", "No", "Edit"]), "确认选项为 Yes / No / Edit");
+	assert(JSON.stringify(selectOptionsSeen) === JSON.stringify(["Yes", "No", "Edit", "重看完整预览"]), "RPC 按 Yes / No / Edit 排列，默认选中 Yes，重看选项在后");
 	assert(toolText(result).startsWith("✓"), "正式写入成功");
 	assert(fs.existsSync(path.join(REPO, formalRel)), "正式文件已创建");
 	assert(fs.readFileSync(path.join(REPO, "projects/wiki/INDEX.md"), "utf8").includes("正式写入测试"), "项目索引已更新");

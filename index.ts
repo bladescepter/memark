@@ -17,6 +17,7 @@ import {
 	PROJECTS_DIR,
 	REPO,
 	git,
+	isFormalMemoryPath,
 	readIndex,
 	resolveRepoPath,
 	unsafeWorktreeChanges,
@@ -25,6 +26,8 @@ import {
 import { handleMemoryCommand, listPendingIds, registerCurator } from "./curator";
 import { buildBaselineContext } from "./baseline";
 import { readHostRole, saveHostRole } from "./host-role";
+import { currentMemory, matchesMemoryPath, parseMetadata } from "./metadata";
+import { waitFor } from "./async";
 
 const MAX_OUTPUT_BYTES = 50 * 1024;
 const MAX_OUTPUT_LINES = 2000;
@@ -143,39 +146,39 @@ export function matchIndexLines(lines: string[], query: string): string[] {
 		.filter((path, index, all) => all.indexOf(path) === index);
 }
 
-function safeReadMemory(rel: string): string | null {
+interface RecallScope { project: string | null; allProjects: boolean }
+
+function safeReadMemory(rel: string, scope: RecallScope): string | null {
 	try {
-		const { abs } = resolveRepoPath(rel);
+		if (!isFormalMemoryPath(rel)) return null;
+		const { abs, rel: normalized } = resolveRepoPath(rel);
+		const parts = normalized.split("/");
+		if (parts[0] === PROJECTS_DIR && (!validProjectName(parts[1]) || (!scope.allProjects && parts[1] !== scope.project))) return null;
 		if (!existsSync(abs)) return null;
-		return readFileSync(abs, "utf8");
+		const text = readFileSync(abs, "utf8");
+		const fields = parseMetadata(text);
+		return fields && currentMemory(fields) && matchesMemoryPath(normalized, fields) ? text : null;
 	} catch {
 		return null;
 	}
 }
 
-function isExpired(text: string): boolean {
-	const expires = text.match(/^expires:\s*(\d{4}-\d{2}-\d{2})$/m)?.[1];
-	return Boolean(expires && expires < new Date().toISOString().slice(0, 10));
-}
-
-function withoutExpiredEntries(lines: string[]): string[] {
+function eligibleEntries(lines: string[], scope: RecallScope): string[] {
 	return lines.filter((line) => {
 		const rel = pathFromIndexLine(line);
-		if (!rel) return true;
-		const text = safeReadMemory(rel);
-		return Boolean(text && !isExpired(text));
+		return Boolean(rel && safeReadMemory(rel, scope));
 	});
 }
 
-function fullTextMatches(lines: string[], query: string, excluded: Set<string>): string[] {
+function fullTextMatches(lines: string[], query: string, excluded: Set<string>, scope: RecallScope): string[] {
 	const tokens = queryTokens(query);
 	const scored: { path: string; score: number; order: number }[] = [];
 	const paths = lines.map(pathFromIndexLine).filter((path): path is string => Boolean(path));
 	for (let i = 0; i < paths.length; i++) {
 		const path = paths[i];
 		if (excluded.has(path)) continue;
-		const text = safeReadMemory(path);
-		if (!text || isExpired(text)) continue;
+		const text = safeReadMemory(path, scope);
+		if (!text) continue;
 		const low = text.slice(0, MAX_SCAN_CHARS_PER_FILE).toLocaleLowerCase();
 		const hits = tokens.filter((token) => low.includes(token)).length;
 		if (hits > 0) scored.push({ path, score: hits + (hits === tokens.length && tokens.length > 1 ? 1 : 0), order: i });
@@ -230,13 +233,19 @@ export default function (pi: ExtensionAPI) {
 
 	async function syncBeforeFirstRecall(): Promise<string | null> {
 		if (firstRecallSync) return firstRecallSync;
-		firstRecallSync = withRepoMutation(async () => {
+		const signal = AbortSignal.timeout(RECALL_SYNC_TIMEOUT_MS);
+		const deadline = Date.now() + RECALL_SYNC_TIMEOUT_MS;
+		const options = () => {
+			signal.throwIfAborted();
+			return { signal, timeout: Math.max(1, deadline - Date.now()) };
+		};
+		firstRecallSync = waitFor(withRepoMutation(async () => {
 			if (!existsSync(join(REPO, ".git"))) return `记忆仓库不存在或尚未初始化：${REPO}`;
-			const dirty = await unsafeWorktreeChanges(pi);
+			const dirty = await unsafeWorktreeChanges(pi, options());
 			if (dirty.length > 0) return `记忆仓库有未处理修改，未自动下载最新版本：${dirty.map((item) => item.path).join(", ")}`;
-			const result = await git(pi, ["pull", "--ff-only", "--quiet"], { timeout: RECALL_SYNC_TIMEOUT_MS - 500 });
+			const result = await git(pi, ["pull", "--ff-only", "--quiet"], options());
 			return result.code === 0 ? null : `自动同步失败，当前使用本地记忆：${(result.stderr || result.stdout).trim()}`;
-		}, { waitMs: 500 }).catch((err) => `自动同步失败，当前使用本地记忆：${(err as Error).message}`);
+		}, { waitMs: 500, signal }), signal).catch((err) => `自动同步失败，当前使用本地记忆：${(err as Error).message}`);
 		return firstRecallSync;
 	}
 
@@ -259,13 +268,14 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			try {
 				if (signal?.aborted) throw new Error("操作已取消");
-				const syncWarning = await syncBeforeFirstRecall();
+				const syncWarning = await waitFor(syncBeforeFirstRecall(), signal);
 				const projectDir = projectDirFor(ctx?.cwd);
+				const scope: RecallScope = { project: projectDir ? basename(projectDir) : null, allProjects: params.all_projects === true };
 				const personalLines = readIndex();
 				const projectLines = params.all_projects
 					? allProjectIndexLines()
 					: projectDir ? readIndex(projectDir) : [];
-				const lines = withoutExpiredEntries([...personalLines, ...projectLines]);
+				const lines = eligibleEntries([...personalLines, ...projectLines], scope);
 				const prefix = syncWarning ? `⚠ ${syncWarning}\n\n` : "";
 				if (lines.every((line) => !line.includes(".md"))) {
 					return { content: [{ type: "text", text: `${prefix}memark：没有可用的正式记忆索引（${REPO}）。` }], details: {} };
@@ -275,13 +285,13 @@ export default function (pi: ExtensionAPI) {
 				const ranked = matchIndexLines(lines, params.query);
 				const combined = [...ranked];
 				if (combined.length < maxFiles) {
-					combined.push(...fullTextMatches(lines, params.query, new Set(combined)));
+					combined.push(...fullTextMatches(lines, params.query, new Set(combined), scope));
 				}
 				const selected = [...new Set(combined)].slice(0, maxFiles);
 				const parts: string[] = [];
 				for (const rel of selected) {
-					const text = safeReadMemory(rel);
-					if (!text || isExpired(text)) continue;
+					const text = safeReadMemory(rel, scope);
+					if (!text) continue;
 					parts.push(`===== ${rel} =====\n${text}`);
 				}
 				if (parts.length === 0) {

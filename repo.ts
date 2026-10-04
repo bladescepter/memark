@@ -9,12 +9,14 @@ import {
 	readdirSync,
 	readFileSync,
 	rmSync,
+	rmdirSync,
 	statSync,
 	writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, win32 } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { waitFor } from "./async";
 
 function expandHome(path: string): string {
 	if (path === "~") return homedir();
@@ -145,8 +147,8 @@ export interface WorktreeChange {
 }
 
 /** 读取未提交改动；-z 避免中文路径被引号转义。 */
-export async function worktreeChanges(pi: ExtensionAPI): Promise<WorktreeChange[]> {
-	const result = await git(pi, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+export async function worktreeChanges(pi: ExtensionAPI, options: ExecOptions = {}): Promise<WorktreeChange[]> {
+	const result = await git(pi, ["status", "--porcelain=v1", "-z", "--untracked-files=all"], options);
 	if (result.code !== 0) throw new Error(`无法读取 git 状态：${(result.stderr || result.stdout).trim()}`);
 	const records = result.stdout.split("\0").filter(Boolean);
 	const changes: WorktreeChange[] = [];
@@ -164,8 +166,8 @@ export async function worktreeChanges(pi: ExtensionAPI): Promise<WorktreeChange[
 }
 
 /** pending 候选允许作为本地未跟踪文件存在；其余改动会阻止自动写入。 */
-export async function unsafeWorktreeChanges(pi: ExtensionAPI): Promise<WorktreeChange[]> {
-	return (await worktreeChanges(pi)).filter(
+export async function unsafeWorktreeChanges(pi: ExtensionAPI, options: ExecOptions = {}): Promise<WorktreeChange[]> {
+	return (await worktreeChanges(pi, options)).filter(
 		(change) => !(change.status === "??" && change.path.startsWith("pending/")),
 	);
 }
@@ -175,15 +177,38 @@ export interface FileSnapshot {
 	rel: string;
 	existed: boolean;
 	content?: Buffer;
+	missingDirs: string[];
 }
 
 export function snapshotFiles(paths: string[]): FileSnapshot[] {
 	return [...new Set(paths)].map((rel) => {
 		const { abs } = resolveRepoPath(rel);
+		const missingDirs: string[] = [];
+		for (let dir = dirname(abs); dir !== REPO && !existsSync(dir); dir = dirname(dir)) {
+			missingDirs.push(relative(REPO, dir).split(process.platform === "win32" ? "\\" : "/").join("/"));
+		}
 		return existsSync(abs)
-			? { rel, existed: true, content: readFileSync(abs) }
-			: { rel, existed: false };
+			? { rel, existed: true, content: readFileSync(abs), missingDirs }
+			: { rel, existed: false, missingDirs };
 	});
+}
+
+/** 必须在获得文件锁后比较，不能把排队期间出现的新版本当成已审核版本。 */
+export function snapshotsMatch(snapshots: FileSnapshot[]): boolean {
+	return snapshots.every((snapshot) => {
+		const { abs } = resolveRepoPath(snapshot.rel);
+		return snapshot.existed ? existsSync(abs) && readFileSync(abs).equals(snapshot.content!) : !existsSync(abs);
+	});
+}
+
+/** 只移除指定空目录；绝不递归删除，也不清理事务前已有的其他目录。 */
+export function removeEmptyDirs(dirs: string[]): void {
+	for (const dir of [...new Set(dirs)].sort((a, b) => b.split("/").length - a.split("/").length)) {
+		try { rmdirSync(resolveRepoPath(dir).abs); }
+		catch (err) {
+			if (!["ENOENT", "ENOTEMPTY", "EEXIST"].includes((err as NodeJS.ErrnoException).code ?? "")) throw err;
+		}
+	}
 }
 
 export function restoreSnapshots(snapshots: FileSnapshot[]): void {
@@ -196,6 +221,7 @@ export function restoreSnapshots(snapshots: FileSnapshot[]): void {
 			rmSync(abs, { force: true });
 		}
 	}
+	removeEmptyDirs(snapshots.flatMap((snapshot) => snapshot.missingDirs));
 }
 
 function sleep(ms: number): Promise<void> {
@@ -217,15 +243,16 @@ export async function withRepoMutation<T>(
 	});
 	const previous = mutationTail;
 	mutationTail = previous.then(() => turn, () => turn);
-	await previous;
-
 	const lockDir = join(REPO, ".git", "memark-write.lock");
-	const started = Date.now();
 	const waitMs = options.waitMs ?? 10_000;
+	const timeout = AbortSignal.timeout(waitMs);
+	const waiting = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
 	let locked = false;
 	try {
+		// 超时同样覆盖进程内队列；取消的 turn 仍排在 previous 之后，不能越过正在写入者。
+		await waitFor(previous, waiting);
 		while (!locked) {
-			if (options.signal?.aborted) throw new Error("操作已取消");
+			waiting.throwIfAborted();
 			try {
 				mkdirSync(lockDir);
 				locked = true;
@@ -252,13 +279,16 @@ export async function withRepoMutation<T>(
 				} catch {
 					// 锁恰好被其他进程释放，继续重试。
 				}
-				if (Date.now() - started >= waitMs) throw new Error("另一项记忆写入仍在进行，请稍后重试");
-				await sleep(100);
+				await waitFor(sleep(100), waiting);
 			}
 		}
+		options.signal?.throwIfAborted();
 		return await fn();
+	} catch (err) {
+		if (!locked && waiting.aborted) throw new Error(options.signal?.aborted ? "操作已取消" : "另一项记忆写入仍在进行，请稍后重试");
+		throw err;
 	} finally {
-		if (locked) rmSync(lockDir, { recursive: true, force: true });
-		releaseQueue();
+		try { if (locked) rmSync(lockDir, { recursive: true, force: true }); }
+		finally { releaseQueue(); }
 	}
 }

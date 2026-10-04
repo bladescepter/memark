@@ -1,6 +1,7 @@
-/** 长预览与批准操作分离；TUI 固定操作区，RPC 完整分页，未知 UI 安全停止。 */
+/** 长预览与批准操作分离；TUI 固定操作区，RPC 一次完整滚动预览，未知 UI 安全停止。 */
 import type { ExtensionContext, ExtensionUIContext, KeybindingsManager, Theme } from "@earendil-works/pi-coding-agent";
-import { matchesKey, ScrollView, Text, truncateToWidth, wrapTextWithAnsi, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { matchesKey, ScrollView, Text, truncateToWidth, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { waitFor } from "./async";
 
 export interface ReviewContext {
 	hasUI?: boolean;
@@ -27,7 +28,7 @@ export class ReviewPanel implements Component {
 	private readonly body: Text;
 	private readonly scroll: ScrollView;
 	private readonly options: ReviewChoice[];
-	private selected = 1; // 默认 No，避免盲按 Enter 即批准。
+	private selected = 0; // 按用户约定：Yes / No / Edit，默认选中 Yes；仍须显式确认。
 	private usable = false;
 	private closed = false;
 	private actionRow = 0;
@@ -134,30 +135,28 @@ export async function showReview(ctx: ReviewContext, review: Review): Promise<Re
 			throw new ReviewUnavailable(`终端审核界面失败：${(err as Error).message}`);
 		}
 	}
-	// RPC 没有终端行数，也不支持 custom。使用有界短页，不能把全部 diff 塞入标题。
-	if (ctx.mode !== "rpc" || !ctx.ui.select) throw new ReviewUnavailable("当前客户端不支持安全审核，请使用 TUI 或支持 select 的 RPC 客户端");
-	const lines = wrapTextWithAnsi(displayText(`${review.summary}\n\n${review.text}`), 48);
-	const pageSize = 6;
-	const pages = Math.max(1, Math.ceil(lines.length / pageSize));
+	// RPC 的多行 editor 提供滚动正文；不再把 diff 塞进 select 标题并逐六行翻页。
+	// editor 没有只读模式：返回值仅校验完整性，绝不作为修改草案或批准操作。
+	if (ctx.mode !== "rpc" || !ctx.ui.select || !ctx.ui.editor) throw new ReviewUnavailable("当前客户端不支持安全审核，请使用 TUI 或支持多行 editor/select 的 RPC 客户端");
+	const preview = displayText(`${review.title}\n${review.summary}\n\n${review.text}`);
 	const opts = { signal: ctx.signal, timeout: 300_000 };
 	try {
-		for (let page = 0; page < pages;) {
+		while (true) {
 			if (ctx.signal?.aborted) return "No";
-			const next = page === pages - 1 ? "审核" : "下一页";
-			const choice = await ctx.ui.select(`memark：预览 ${page + 1}/${pages}\n${lines.slice(page * pageSize, (page + 1) * pageSize).join("\n")}`,
-				page > 0 ? [next, "上一页", "取消"] : [next, "取消"], opts);
+			const timeout = AbortSignal.timeout(opts.timeout);
+			const signal = ctx.signal ? AbortSignal.any([ctx.signal, timeout]) : timeout;
+			const viewed = await waitFor(ctx.ui.editor("memark：完整变更预览（滚动查看，勿修改；提交仅进入确认）", preview), signal);
+			if (ctx.signal?.aborted) return "No";
+			if (viewed === undefined) throw new ReviewUnavailable("RPC 预览已关闭，候选保留待重新审核");
+			if (viewed.replace(/\r\n/g, "\n") !== preview) throw new ReviewUnavailable("预览被修改或截断，未批准；改正文请在完整预览后的确认窗口选择 Edit");
+			const choice = await ctx.ui.select("memark：完整变更已展示，是否写入？", review.canEdit ? ["Yes", "No", "Edit", "重看完整预览"] : ["Yes", "No", "重看完整预览"], opts);
 			if (ctx.signal?.aborted) return "No";
 			if (choice === undefined) throw new ReviewUnavailable("RPC 审核已关闭或超时，候选保留待重新审核");
-			if (choice === "上一页" && page > 0) page--;
-			else if (choice === next) page++;
-			else return "No"; // 取消、超时或客户端的异常返回都不能批准。
+			if (choice === "重看完整预览") continue;
+			return choice === "Yes" || (choice === "Edit" && review.canEdit) ? choice : "No";
 		}
-		if (ctx.signal?.aborted) return "No";
-		const choice = await ctx.ui.select("memark：已展示全部变更，是否写入？", review.canEdit ? ["Yes", "No", "Edit"] : ["Yes", "No"], opts);
-		if (ctx.signal?.aborted) return "No";
-		if (choice === undefined) throw new ReviewUnavailable("RPC 审核已关闭或超时，候选保留待重新审核");
-		return choice === "Yes" || (choice === "Edit" && review.canEdit) ? choice : "No";
 	} catch (err) {
+		if (ctx.signal?.aborted) return "No";
 		throw new ReviewUnavailable(`RPC 审核界面失败：${(err as Error).message}`);
 	}
 }

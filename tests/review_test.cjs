@@ -56,16 +56,20 @@ const load = (file) => import(pathToFileURL(file).href);
 		panel.handleInput("\x1b[H");
 		assert(panel.render(78).some((line) => line.includes("FIRST_SENTINEL")));
 		panel.handleInput("\r");
-		assert.deepEqual(results, ["No"], "默认 Enter 不得批准");
+		assert.deepEqual(results, ["Yes"], "按用户要求默认 Yes，Enter 显式批准");
 		overlay.hide(); panel.dispose();
 		console.log(`✓ ${tui.mode}：长预览、中文宽字、缩放、分页、完整尾部与固定操作区`);
 	}
 
 	const fakeTui = { terminal: { rows: 24 }, requestRender() {} };
-	for (const [keys, expected] of [[["1", "\r"], "Yes"], [["3", "\r"], "Edit"], [["\x1b"], "No"]]) {
+	for (const [keys, expected] of [[["\r"], "Yes"], [["1", "\r"], "Yes"], [["2", "\r"], "No"], [["3", "\r"], "Edit"], [["\x1b"], "No"]]) {
 		const results = [];
 		const panel = new ReviewPanel(review, fakeTui, theme, kb, (choice) => results.push(choice));
-		panel.render(80);
+		const rendered = panel.render(80);
+		const actionRows = ["1 Yes", "2 No", "3 Edit"].map((label) => rendered.findIndex((line) => line.includes(label)));
+		assert(actionRows[0] >= 0 && actionRows[0] < actionRows[1] && actionRows[1] < actionRows[2], "TUI 按 Yes / No / Edit 排列");
+		assert(rendered[actionRows[0]].includes("→"), "初始焦点位于 Yes");
+		assert.deepEqual(results, [], "默认选中不等于自动批准");
 		for (const key of keys) panel.handleInput(key);
 		assert.deepEqual(results, [expected]); panel.dispose();
 	}
@@ -78,37 +82,47 @@ const load = (file) => import(pathToFileURL(file).href);
 	controller.abort(); panel.handleInput("\r"); assert.equal(result, "No"); panel.dispose();
 	fakeTui.terminal.rows = 24;
 	assert.equal(displayText("\x1b[2J\r\n\u202e"), "\\u001b[2J\n\\u202e");
-	console.log("✓ Yes/No/Edit 输入、默认拒绝、小屏保护、Abort 和终端控制字符处理");
+	console.log("✓ Yes/No/Edit 顺序、默认选中 Yes、显式确认、小屏保护与取消");
 
-	let customCalls = 0, pageCalls = 0, finalCalls = 0;
-	const pageTexts = [];
+	let customCalls = 0, viewCalls = 0, finalCalls = 0;
 	const rpc = { hasUI: true, mode: "rpc", ui: {
 		custom: () => { customCalls++; throw new Error("RPC must not use custom"); },
+		editor: async (title, prefill) => {
+			viewCalls++;
+			assert(title.length < 80 && !title.includes("\n"));
+			assert(prefill.includes("FIRST_SENTINEL") && prefill.includes("LAST_SENTINEL"));
+			assert(prefill.length > 30000, "完整长预览不截断、不放入标题");
+			return prefill;
+		},
 		select: async (title, options) => {
-			if (title.startsWith("memark：预览")) {
-				pageCalls++; pageTexts.push(title);
-				assert(title.split("\n").length <= 7);
-				assert(title.split("\n").every((line) => visibleWidth(line) <= 48));
-				if (pageCalls === 2) return "上一页";
-				return options[0];
-			}
 			finalCalls++; assert.equal(title.split("\n").length, 1);
-			assert.deepEqual(options, ["Yes", "No", "Edit"]); return "Yes";
+			assert.deepEqual(options, ["Yes", "No", "Edit", "重看完整预览"]); return "Yes";
 		},
 	} };
-	assert.equal(await showReview(rpc, { ...review, text: "RPC_START\n" + "多文件预览\n".repeat(50) + "RPC_END" }), "Yes");
-	assert.equal(customCalls, 0); assert.equal(finalCalls, 1);
-	assert(pageTexts.join("\n").includes("RPC_START") && pageTexts.join("\n").includes("RPC_END"));
-	assert.equal(await showReview({ ...rpc, ui: { select: async () => "取消" } }, review), "No");
-	await assert.rejects(() => showReview({ ...rpc, ui: { select: async () => undefined } }, review), /关闭或超时/);
+	assert.equal(await showReview(rpc, review), "Yes");
+	assert.equal(customCalls, 0); assert.equal(viewCalls, 1); assert.equal(finalCalls, 1);
+	let revisit = 0;
+	assert.equal(await showReview({ ...rpc, ui: { ...rpc.ui, select: async () => revisit++ === 0 ? "重看完整预览" : "No" } }, review), "No");
+	assert.equal(viewCalls, 3, "可主动重看，但不强制数百次翻页");
+	assert.equal(await showReview({ ...rpc, ui: { ...rpc.ui, select: async (_title, options) => options[0] } }, review), "Yes");
+	assert.equal(await showReview({ ...rpc, ui: { ...rpc.ui, select: async () => "Edit" } }, review), "Edit");
+	assert.equal(await showReview({ ...rpc, ui: { ...rpc.ui, select: async () => "取消" } }, review), "No");
+	await assert.rejects(() => showReview({ ...rpc, ui: { ...rpc.ui, select: async () => undefined } }, review), /关闭或超时/);
+	const noApprove = async () => { throw new Error("不完整预览不得进入确认"); };
+	await assert.rejects(() => showReview({ ...rpc, ui: { editor: async (_t, p) => p.slice(0, 30000), select: noApprove } }, review), /修改或截断/);
+	await assert.rejects(() => showReview({ ...rpc, ui: { editor: async () => undefined, select: noApprove } }, review), /预览已关闭/);
+	await assert.rejects(() => showReview({ ...rpc, ui: { select: noApprove } }, review), /不支持安全审核/);
+	const abortView = new AbortController();
+	const waiting = showReview({ ...rpc, signal: abortView.signal, ui: { select: noApprove, editor: () => new Promise(() => {}) } }, review);
+	abortView.abort(); assert.equal(await waiting, "No", "RPC editor 未响应时中断也能退出");
 	await assert.rejects(() => showReview({ hasUI: true, mode: "tui", ui: {} }, review), /不支持安全审核/);
 	await assert.rejects(() => showReview({ hasUI: true, mode: "tui", ui: { custom: async () => undefined } }, review), /未提供审核结果/);
-	console.log("✓ RPC 完整有界分页、返回上一页、超时/取消和无能力降级");
+	console.log("✓ RPC 一次完整滚动预览、Yes/No/Edit 顺序、默认选中 Yes、重看与取消降级");
 
 	// 指纹测试只修改隔离副本，不动开发代码或真实安装。
 	const source = path.join(process.env.TEST_AGENT_DIR, "runtime-copy");
 	fs.mkdirSync(source, { recursive: true });
-	for (const file of ["package.json", "index.ts", "curator.ts", "repo.ts", "baseline.ts", "host-role.ts", "review-ui.ts", "diagnostics.ts"]) {
+	for (const file of ["package.json", "index.ts", "curator.ts", "repo.ts", "baseline.ts", "host-role.ts", "review-ui.ts", "diagnostics.ts", "metadata.ts", "async.ts"]) {
 		fs.copyFileSync(path.join(__dirname, "..", file), path.join(source, file));
 	}
 	const runtime = captureRuntime(source);
