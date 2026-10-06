@@ -12,7 +12,7 @@ memark = **mem**ory + **m**arkdown，pi 编码代理的长期记忆扩展。
 
 | 仓库 | 内容 | 状态 |
 |---|---|---|
-| `memark`（本仓库） | 扩展代码：recall 工具、curator 流程、/memory 命令；Jev 门卫已搁置 | v0.3.4 |
+| `memark`（本仓库） | 扩展代码：recall 工具、curator 流程、/memory 命令；Jev 门卫已搁置 | v0.3.5 |
 | `memory`（独立私有仓库） | 记忆数据：五层目录、README 路由协议、INDEX.md、scripts/ | 已创建并推送；默认路径 `~/DEV/memory`（`$MEMARK_REPO` 可覆盖） |
 
 分工原则：**协议和校验跟数据走**——校验脚本放 memory 仓库（无扩展也能自检），本仓库只承载 pi 集成逻辑。
@@ -26,6 +26,7 @@ memark = **mem**ory + **m**arkdown，pi 编码代理的长期记忆扩展。
 - v0.3.2 交互与效率：确认窗口改为 Yes / No / Edit 三选项（Edit 在终端编辑器改草案后重新校验）；category 可省略并按 type 自动归档、单复数归一化；新增 /memory edit 与 memark_remember 的 edit 参数支持原地修改措辞
 - v0.3.3：分类以 type 唯一推导（旧 category 兼容、冲突拒绝）；TUI 滚动预览与固定三选项、RPC 分页；新草案可在 Edit 中改归属；status 显示加载版本/路径/代码指纹。真实参数链和普通/全屏渲染测试通过，标签 v0.3.3；逐机交互验收仍待完成，详见方案 §8.3 与 README。
 - v0.3.4：RPC 一次完整滚动预览后独立确认；按用户要求，TUI/RPC 均为 Yes / No / Edit 顺序、默认选中 Yes（仍须显式确认）。文件锁内重查审核快照；pending 版本保护；失败回滚清理本次空目录；recall 重查审核状态/范围；统一引号/null 元数据与有效期；首次同步总预算；完整预检撤销。memory 协议配套隔离 pending 链接，升级需同步两个仓库；新增真实 Pi 文件队列回归。
+- v0.3.5：记忆写入可选参数支持省略与 null，兼容强制全字段必填的模型接口；核心必填 null 和真实分类冲突仍拒绝，不绕过用户审核。测试入口兼容 Pi 1.0，Pi 0.85.1 / 本机 1.0.0 全套回归通过；本次无需修改 memory 协议，逐机模型调用验收仍待完成。
 - 开发工作区新增每轮 `before_agent_start` 基线与本机角色注入（只读已审核个人摘要 + 本机首次交互设定角色/实时 OS；不使用 hostname 或设备 ID；尚待逐机验收）
 - memory 私有仓库已创建并推送：`git@github.com:bladescepter/memory.git`，本地路径 `~/DEV/memory`，初始协议 commit `1ad6d0d`
 - P1 已完成：五层目录、根/分层 README 路由、frontmatter 规范、INDEX 生成、schema/secret/重复/链接校验、pre-commit hook 和单元测试均已建立
@@ -37,7 +38,7 @@ memark = **mem**ory + **m**arkdown，pi 编码代理的长期记忆扩展。
 
 ## 下一步
 
-1. 各机同时更新 v0.3.4 扩展与 memory 协议脚本，各运行实例 `/reload` 并用 `/memory status` 核对加载指纹；逐机实测新项目长预览的 Yes / No / Edit、缩放与改归属，再完成真实 recall、正式写入和 `/memory sync` 的 P3 验收
+1. 各机更新 v0.3.5 扩展（从 v0.3.4 之前升级时还需同步配套 memory 协议脚本），各运行实例 `/reload` 并用 `/memory status` 核对加载版本和指纹；逐机实测新项目长预览的 Yes / No / Edit、缩放与改归属，再完成真实 recall、正式写入和 `/memory sync` 的 P3 验收
 2. 日常使用，观察漏召回、误报和同步冲突
 3. 基线与当前主机注入已实现（保守长度上限），需按方案 §3.2、§6.1 在各机首次交互设置本机角色，并实测角色、OS 及 token 数
 
