@@ -14,7 +14,7 @@ const sdk = process.env.MEMARK_TEST_PI_ROOT || path.resolve(G, "..");
 const { createJiti } = createRequire(path.resolve(G, "../package.json"))("jiti");
 const sdkRequire = createRequire(path.join(sdk, "package.json"));
 const tuiEntry = sdkRequire.resolve("@earendil-works/pi-tui");
-const coreRoot = path.dirname(sdkRequire.resolve("@earendil-works/pi-agent-core/package.json"));
+const { createToolPipeline } = require("./tool-pipeline.cjs");
 const jiti = createJiti(__filename, {
 	alias: {
 		"@earendil-works/pi-ai": path.join(__dirname, "stub-pi-ai.cjs"),
@@ -101,17 +101,8 @@ const assert = (condition, message) => {
 const toolText = (result) => result.content[0].text;
 const pendingFiles = () => fs.readdirSync(path.join(REPO, "pending")).filter((file) => file.endsWith(".md") && file !== "README.md");
 // 走真实 Pi 的 wrapper → prepareArguments → schema 校验，不再直接跳进 execute。
-const pipeline = Promise.all([
-	import(pathToFileURL(path.join(coreRoot, "dist/harness/execution/tools.js")).href),
-	import(pathToFileURL(path.join(sdk, "dist/core/tools/tool-definition-wrapper.js")).href),
-]);
-const remember = async (params, context = ctx, signal) => {
-	const [{ prepareToolCall }, { wrapToolDefinition }] = await pipeline;
-	const tool = wrapToolDefinition(tools.memark_remember, () => context);
-	const prepared = prepareToolCall({ id: "test", name: tool.name, arguments: params }, [tool]);
-	if (prepared.kind === "immediate") throw new Error(prepared.result.content[0].text);
-	return prepared.tool.execute("test", prepared.args, signal, undefined, context);
-};
+const executeTool = createToolPipeline(sdk);
+const remember = (params, context = ctx, signal) => executeTool(tools.memark_remember, params, context, signal);
 
 function addRemoteMemory() {
 	const other = path.join(BASE, "remote-writer");
@@ -351,7 +342,78 @@ function addRemoteMemory() {
 	result = await remember({ title: "自动归档技能", description: "省略 category 的 knowledge 写入", body: "技能正文。", tags: ["测试"], zone: "personal", layer: "knowledge", type: "Skill" });
 	assert(toolText(result).startsWith("✓") && fs.existsSync(path.join(REPO, "knowledge/skills/自动归档技能.md")), "个人区 knowledge 省略 category 时按 type 自动归档");
 	const curatorMod = jiti(path.join(__dirname, "..", "curator.ts"));
-	assert(JSON.stringify(tools.memark_remember.parameters.properties.category.enum) === JSON.stringify(["current", "relationships"]), "模型 schema 不再混合个人区和项目区 category");
+	assert(JSON.stringify(tools.memark_remember.parameters.properties.category.anyOf?.[0].enum) === JSON.stringify(["current", "relationships"]), "模型 schema 的非空 category 仍仅允许 Context 分类");
+
+	// 同时模拟标准 strict 转换和只把字段改为必填的代理，先验证请求再走真实执行链。
+	const aiRoot = sdkRequire.resolve.paths("@earendil-works/pi-ai")
+		.map((root) => path.join(root, "@earendil-works/pi-ai"))
+		.find((root) => fs.existsSync(path.join(root, "dist/api/constrained-sampling.js")));
+	assert(aiRoot, "使用被测 Pi 安装的真实 schema 转换与校验模块");
+	const { makeStrictJsonSchema } = await import(pathToFileURL(path.join(aiRoot, "dist/api/constrained-sampling.js")).href);
+	const { validateToolArguments } = await import(pathToFileURL(path.join(aiRoot, "dist/utils/validation.js")).href);
+	const wireSchema = JSON.parse(JSON.stringify(tools.memark_remember.parameters));
+	const optionalFields = ["layer", "category", "project", "expires", "supersedes", "edit", "as_pending"];
+	const nullOptions = Object.fromEntries(optionalFields.map((field) => [field, null]));
+	const nullableDraft = { ...nullOptions, title: "空值归档测试", description: "虚构的 nullable 工具参数测试", body: "测试正文。", tags: ["测试"], zone: "personal", type: "Learning" };
+	const forcedRequiredSchema = { ...wireSchema, required: Object.keys(wireSchema.properties), additionalProperties: false };
+	for (const schema of [forcedRequiredSchema, makeStrictJsonSchema(wireSchema)]) {
+		const wireTool = { name: "memark_remember", parameters: schema };
+		const validated = validateToolArguments(wireTool, { name: wireTool.name, arguments: nullableDraft });
+		assert(optionalFields.every((field) => validated[field] === null), "全部可选字段在必填/strict 请求 schema 中保留合法 null");
+	}
+	assert(optionalFields.every((field) => !wireSchema.required.includes(field)), "普通调用仍可省略可选字段");
+	const originalNullable = JSON.stringify(nullableDraft);
+	const preparedNullable = tools.memark_remember.prepareArguments(nullableDraft);
+	assert(preparedNullable.layer === "knowledge" && optionalFields.filter((field) => field !== "layer").every((field) => !Object.hasOwn(preparedNullable, field)), "校验前清理可选 null，Learning 只由 type 推导归属");
+	assert(JSON.stringify(nullableDraft) === originalNullable, "null 归一化不修改调用方参数");
+	assert(curatorMod.resolveTargetPath(nullableDraft).path === "knowledge/learnings/空值归档测试.md", "直接路径解析与工具链采用相同 null 语义");
+
+	const beforeNullableHead = (await git(["rev-parse", "HEAD"])).stdout;
+	const beforeNullablePreview = previewTitles.length;
+	let nullableConfirmed = false;
+	const nullableContext = { ...ctx, ui: { ...ctx.ui, select: async (_title, options) => {
+		nullableConfirmed = true;
+		assert(previewTitles.length > beforeNullablePreview && previewTitles.at(-1).includes("knowledge/learnings/空值归档测试.md"), "null 调用先展示正确个人区完整预览");
+		assert(JSON.stringify(options.slice(0, 3)) === JSON.stringify(["Yes", "No", "Edit"]), "null 调用不改变审核选项顺序");
+		assert(!fs.existsSync(path.join(REPO, "knowledge/learnings/空值归档测试.md")), "null 不触发提前写入");
+		return "No";
+	} } };
+	await remember(nullableDraft, nullableContext);
+	assert(nullableConfirmed && (await git(["rev-parse", "HEAD"])).stdout === beforeNullableHead && pendingFiles().length === 0, "as_pending=null 仍经审核，No 不写入或提交");
+	result = await remember(nullableDraft);
+	assert(toolText(result).startsWith("✓") && fs.existsSync(path.join(REPO, "knowledge/learnings/空值归档测试.md")), "显式 Yes 后 nullable Learning 正式写入并推送");
+
+	for (const [zone, type, overrides, target] of [
+		["personal", "Context", {}, "context/空值待审测试.md"],
+		["personal", "Context", { category: "relationships" }, "context/relationships/空值待审测试.md"],
+		["project", "Topic", { project: "wiki" }, "projects/wiki/topics/空值待审测试.md"],
+		["project", "Handoff", { project: "wiki", expires: "2099-01-01" }, "projects/wiki/handoffs/空值待审测试.md"],
+	]) {
+		const args = { ...nullableDraft, zone, type, title: "空值待审测试", ...overrides, as_pending: true };
+		validateToolArguments({ name: "memark_remember", parameters: forcedRequiredSchema }, { name: "memark_remember", arguments: args });
+		result = await remember(args);
+		assert(toolText(result).includes(target), `${type} 的 null/实际值组合保持原归属语义`);
+		fs.rmSync(path.join(REPO, "pending", pendingFiles()[0]));
+	}
+	for (const overrides of [
+		{ category: "current" },
+		{ category: "relationships" },
+		{ layer: "context" },
+		{ project: "wiki" },
+		{ zone: "project", type: "Topic" },
+		{ zone: "project", type: "Handoff", project: "wiki" },
+		{ title: null },
+		{ description: null },
+		{ body: null },
+		{ tags: null },
+		{ zone: null },
+		{ type: null },
+	]) {
+		let error;
+		try { await remember({ ...nullableDraft, title: "空值非法测试", ...overrides }); } catch (err) { error = err; }
+		assert(error, "nullable 不掩盖分类冲突、条件必填或核心字段 null");
+	}
+	assert(pendingFiles().length === 0 && (await git(["status", "--porcelain"])).stdout.trim() === "", "非法 nullable 调用不留下候选或正式改动");
 	const categoryBase = { title: "分类兼容测试", description: "虚构分类测试", body: "分类测试正文。", tags: ["测试"], zone: "project", project: "wiki", as_pending: true };
 	for (const [type, category, directory] of [["Decision", "Decisions", "decisions"], ["Topic", "Topic ", "topics"], ["Incident", "INCIDENT", "incidents"], ["Handoff", "handoff", "handoffs"]]) {
 		const args = { ...categoryBase, type, category, ...(type === "Handoff" ? { expires: "2099-01-01" } : {}) };
@@ -512,8 +574,8 @@ function addRemoteMemory() {
 	assert(commitFiles.includes("编辑流程测试.md") && !commitFiles.includes("pending/"), "edit 的 commit 只包含该记忆");
 	assert((await git(["status", "--porcelain"])).stdout.trim() === "", "edit 后工作区干净");
 
-	result = await remember({ title: "编辑流程测试", description: "更新后的描述", body: "模型改写正文。", tags: ["测试"], zone: "personal", layer: "principles", type: "Principle", edit: editTarget });
-	assert(toolText(result).startsWith("✓"), "memark_remember edit 参数原地改写");
+	result = await remember({ ...nullOptions, title: "编辑流程测试", description: "更新后的描述", body: "模型改写正文。", tags: ["测试"], zone: "personal", type: "Principle", edit: editTarget });
+	assert(toolText(result).startsWith("✓"), "memark_remember edit 实际路径与其他 null 参数可原地改写");
 	const editedText = fs.readFileSync(path.join(REPO, editTarget), "utf8");
 	assert(editedText.includes("模型改写正文。") && editedText.includes("更新后的描述"), "edit 参数更新正文与描述");
 	assert(editedText.includes("type: Principle") && /^timestamp: \d{4}-\d{2}-\d{2}$/m.test(editedText), "edit 参数保留原 type 与 timestamp");

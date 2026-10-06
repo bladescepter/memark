@@ -7,7 +7,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { execFile } = require("node:child_process");
 const { createRequire } = require("node:module");
-const { pathToFileURL } = require("node:url");
+const { createToolPipeline } = require("./tool-pipeline.cjs");
 const REPO = process.env.TEST_REPO;
 const sdk = process.env.MEMARK_TEST_PI_ROOT || path.resolve(process.env.PI_NODE_MODULES, "..");
 const sdkRequire = createRequire(path.join(sdk, "package.json"));
@@ -54,18 +54,8 @@ const pi = { registerTool: d => tools[d.name] = d, registerCommand: (n, d) => co
 	return result;
 } };
 extension.default(pi);
-const coreRoot = path.dirname(sdkRequire.resolve("@earendil-works/pi-agent-core/package.json"));
-const pipeline = Promise.all([
-	import(pathToFileURL(path.join(coreRoot, "dist/harness/execution/tools.js")).href),
-	import(pathToFileURL(path.join(sdk, "dist/core/tools/tool-definition-wrapper.js")).href),
-]);
-async function remember(args) {
-	const [{ prepareToolCall }, { wrapToolDefinition }] = await pipeline;
-	const tool = wrapToolDefinition(tools.memark_remember, () => ctx);
-	const prepared = prepareToolCall({ id: "safety", name: tool.name, arguments: args }, [tool]);
-	if (prepared.kind === "immediate") throw new Error(txt(prepared.result));
-	return tool.execute("safety", prepared.args, undefined, undefined, ctx);
-}
+const executeTool = createToolPipeline(sdk);
+const remember = args => executeTool(tools.memark_remember, args, ctx);
 const command = args => commands.memory.handler(args, ctx);
 const recall = async (query, selected = tools, all_projects = false) => txt(await selected.memark_recall.execute("recall", { query, max_files: 10, all_projects }, undefined, undefined, { cwd: "/workspace/none" }));
 function freshRecall(exec = pi.exec) {

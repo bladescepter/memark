@@ -5,7 +5,7 @@
  * 所有写入按仓库串行，使用安全相对路径、精确暂存和精确回滚。
  */
 import { withFileMutationQueue, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
+import { Type, type TSchema } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
 	existsSync,
@@ -103,6 +103,17 @@ export interface Draft {
 	supersedes?: string;
 	edit?: string;
 	timestamp?: string;
+	as_pending?: boolean;
+}
+
+const REQUIRED_ARGUMENTS = ["title", "description", "body", "tags", "zone", "type"] as const;
+const OPTIONAL_ARGUMENTS = ["layer", "category", "project", "expires", "supersedes", "edit", "as_pending"] as const;
+
+function optionalNullable<T extends TSchema>(schema: T, description: string) {
+	// Some request adapters require every property; null must remain a legal unused value.
+	return Type.Optional(Type.Union([schema, Type.Null()], {
+		description: `${description}；不适用时省略或传 null`,
+	}));
 }
 
 interface Ctx extends ReviewContext {
@@ -135,6 +146,9 @@ function normalizeCategory(value: string): string {
 /** 唯一分类来源是 zone + type。prepareArguments 与直接执行/路径解析共用此入口。 */
 export function normalizeLocation(input: Draft): Draft {
 	const d = { ...input };
+	// Reject required nulls before Pi can coerce them into strings such as "null".
+	for (const field of REQUIRED_ARGUMENTS) if (d[field] === null) throw new Error(`${field} 不能为 null`);
+	for (const field of OPTIONAL_ARGUMENTS) if (d[field] === null) delete d[field];
 	if (d.edit) {
 		// 原地编辑采用原文件的归属；调用方的路由字段不参与改写。
 		delete d.category;
@@ -160,7 +174,7 @@ export function normalizeLocation(input: Draft): Draft {
 	} else throw new Error("zone 必须是 personal 或 project");
 	if (expected) {
 		if (d.category && d.category !== expected) {
-			throw new Error(`分类冲突：zone=${d.zone}, type=${d.type} 唯一对应 ${expected}，收到 category=${d.category}；请删除冗余 category，或核实 type。不会自动改变适用范围`);
+			throw new Error(`分类冲突：zone=${d.zone}, type=${d.type} 唯一对应 ${expected}，收到 category=${d.category}；请删除冗余 category（若接口要求必填则传 null），或核实 type。不会自动改变适用范围`);
 		}
 		delete d.category; // 旧调用仍可传匹配值，但规范参数不再携带重复选择。
 	}
@@ -808,7 +822,7 @@ export function registerCurator(pi: ExtensionAPI): void {
 		description:
 			"将一条用户明确要求记住的内容写入记忆仓库：先在临时副本校验并展示修改预览（Yes / No / Edit，可当场编辑措辞），用户确认后才写入正式目录、精确提交并推送。" +
 			"新建记忆在无可靠 UI、离线或仓库存在未处理修改时只保存本机 pending/；原地编辑无法审核时停止，须重新发起。" +
-			"个人区 zone=personal；项目区 zone=project + project。目录由 type 唯一推导，项目区与 knowledge 不要传 category；Handoff 必须设置 expires。" +
+			"个人区 zone=personal；项目区 zone=project + project。目录由 type 唯一推导，项目区与 knowledge 不要传 category 值（可省略或传 null）；Handoff 必须设置 expires。" +
 			"优先核对已有项目，跨项目规则归个人区；新项目及辅助文件必须在预览中由用户批准。不得为绕过错误改变适用范围。" +
 			`调整已有记忆措辞时提供 edit=<仓库相对路径> 原地更新。仅在用户明确要求记住或修改时调用。运行：${runtime.label}。`,
 		promptSnippet: "Write an explicitly requested memory through memark's reviewed draft flow",
@@ -821,18 +835,14 @@ export function registerCurator(pi: ExtensionAPI): void {
 			body: Type.String({ description: "记忆正文：最小、可执行，不含敏感信息" }),
 			tags: Type.Array(Type.String(), { minItems: 1, description: "跨目录主题标签" }),
 			zone: StringEnum(["personal", "project"] as const),
-			layer: Type.Optional(StringEnum(["identity", "principles", "preferences", "context", "knowledge"] as const, { description: "个人区可省略，按 type 推导；项目区不要传" })),
-			category: Type.Optional(StringEnum(["current", "relationships"] as const, {
-				description: "仅个人区 Context 可指定 current/relationships；其余类型不要传，目录完全由 type 推导",
-			})),
-			project: Type.Optional(Type.String({ description: "项目名（zone=project 必填）" })),
+			layer: optionalNullable(StringEnum(["identity", "principles", "preferences", "context", "knowledge"] as const), "个人区可省略，按 type 推导；项目区不使用"),
+			category: optionalNullable(StringEnum(["current", "relationships"] as const), "仅个人区 Context 可指定 current/relationships；其余类型目录完全由 type 推导"),
+			project: optionalNullable(Type.String(), "项目名（zone=project 必填）；个人区不使用"),
 			type: StringEnum(ALL_TYPES),
-			expires: Type.Optional(Type.String({ description: "真实的 YYYY-MM-DD 日期（Handoff 必填）" })),
-			supersedes: Type.Optional(Type.String({ description: "被取代记忆的仓库相对路径" })),
-			edit: Type.Optional(Type.String({
-				description: "原地改写的已有记忆仓库相对路径（调整措辞）；提供时只采用 title/description/body/tags，保留原 type/timestamp/scope/expires/supersedes",
-			})),
-			as_pending: Type.Optional(Type.Boolean({ description: "只保存为本机待审核候选" })),
+			expires: optionalNullable(Type.String(), "真实的 YYYY-MM-DD 日期（Handoff 必填）"),
+			supersedes: optionalNullable(Type.String(), "被取代记忆的仓库相对路径"),
+			edit: optionalNullable(Type.String(), "原地改写的已有记忆仓库相对路径（调整措辞）；提供时只采用 title/description/body/tags，保留原 type/timestamp/scope/expires/supersedes"),
+			as_pending: optionalNullable(Type.Boolean(), "只保存为本机待审核候选；省略或 null 不跳过用户审核"),
 		}),
 		prepareArguments(args) {
 			if (!args || typeof args !== "object") return args as never;
@@ -861,7 +871,7 @@ export function registerCurator(pi: ExtensionAPI): void {
 					throw new Error("新记忆不能用同一路径取代自身");
 				}
 
-				if (params.as_pending || !ctx?.hasUI) {
+				if (draft.as_pending || !ctx?.hasUI) {
 					const text = await savePending(pi, draft, rel);
 					return { content: [{ type: "text", text }], details: {} };
 				}

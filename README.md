@@ -78,6 +78,8 @@ pi update --extensions
 
 **分类只由 `zone + type` 决定**：项目区传 `project + type`，不传 `category`；个人区 `layer` 可省略，knowledge 子目录也按 type 推导。`category` 仅向模型提供 Context 的 `current/relationships`。旧调用中匹配 type 的 category 仍兼容单复数、大小写和空白，规范化后移除；真正的类型/范围冲突明确拒绝，不为绕过错误擅自改成个人区。
 
+**可选参数与严格 schema**：`layer/category/project/expires/supersedes/edit/as_pending` 均可省略或传 `null`。若模型接口要求所有字段必填，不适用的字段填 `null`，不要强行选择 `current` 或其他冲突值。参数预处理将这些 `null` 转为省略，再按原规则校验；项目区仍必须有实际 `project`，Handoff 仍必须有实际 `expires`。`as_pending=null` 与省略相同，不等于批准，也不绕过预览审核。标题、描述、正文、标签、区域和类型等核心必填字段拒绝 `null`，不让 Pi 将其转换成字符串 `"null"`。
+
 **TUI 审核**：完整预览独立滚动，按 Yes / No / Edit 顺序固定显示，默认选中 Yes（须按 Enter 或点击才批准，不会自动写入）。↑↓ 或 1/2/3 选择，Enter 确认；PgUp/PgDn、Home/End 或鼠标滚轮查看内容，Esc 取消。过小窗口禁止批准，提示放大。新项目显著标明“新建项目”和记忆/辅助文件数量，README 与 INDEX 不冒充多条记忆。Edit → 修改归属可选择已有项目、新项目或个人区；跨区时由用户重新选择类型，旧项目附带文件不混入新计划。
 
 **RPC 审核**：不再逐六行翻页。通过多行 editor 一次展示完整、可滚动的 diff；预览标题保持简短，正文不截断。预览窗口的“提交”**只是进入确认，不是批准写入**；下一窗口按 Yes / No / Edit 顺序提供操作，“重看完整预览”在其后；默认选中 Yes，仍须显式确认。预览仅用于查看，修改正文请在下一步选择 Edit；预览文本若被客户端截断或意外改动，会停止并保留候选，不将被改动的 diff 当成草案。需要支持多行 editor/select 的 RPC 客户端；能力不足、关闭或超时保留 pending，不回退到长标题或大量短分页。
@@ -114,11 +116,11 @@ npm test
 
 测试先执行严格的 TypeScript 类型检查，再使用 `tests/fixtures/memory/` 中完全虚构的独立记忆库；不读取私人 `~/DEV/memory`。覆盖首次查找同步、项目隔离、待审核批准/拒绝、确认前编辑、原地编辑、敏感信息、路径越界、失败恢复、并发写入、远端竞态、归档、撤销、索引修复和基线/本机角色注入。
 
-分类测试经过真实 Pi wrapper → prepareArguments → schema 校验链；`tests/review_test.cjs` 使用真实 Pi 普通/全屏 overlay 合成器，覆盖长预览、中文宽字符、窗口缩放、固定按钮、键盘/取消、RPC 完整滚动预览与版本漂移。完整工具流程还覆盖新项目批准/取消、Edit 改归属及失败后保留最新 pending。GitHub 对 Pi 0.85.1 / 0.87.1 运行同一套测试；这不替代各机实际终端或 RPC 客户端的人工验收。
+分类测试经过真实 Pi wrapper → prepareArguments → schema 校验链，并用被测 Pi 的 strict schema 转换/校验模块及只强制全字段必填的代理形式验证 nullable 请求，覆盖 Learning 审核拒绝/批准、Context/项目/Handoff 归属及条件必填、原地编辑和真实冲突拒绝；`tests/review_test.cjs` 使用真实 Pi 普通/全屏 overlay 合成器，覆盖长预览、中文宽字符、窗口缩放、固定按钮、键盘/取消、RPC 完整滚动预览与版本漂移。完整工具流程还覆盖新项目批准/取消、Edit 改归属及失败后保留最新 pending。GitHub 对 Pi 0.85.1 / 0.87.1 运行同一套测试；这不替代各机实际终端或 RPC 客户端的人工验收。
 
 `tests/safety_test.cjs` 覆盖真实 Pi 文件队列竞争、忽略文件碰撞、pending 版本竞争/拒绝、新项目失败回滚、陈旧或错区索引、引号/null 元数据、同步总预算、候选链接隔离，以及完整预检撤销。文件队列不再用“直接执行回调”的 mock 代替。
 
-可用 `MEMARK_TEST_PI_ROOT=/实际安装的/pi-coding-agent npm test` 对另一已安装 Pi 的参数处理和渲染组件复测（类型检查仍用项目依赖）。
+可用 `MEMARK_TEST_PI_ROOT=/实际安装的/pi-coding-agent npm test` 对另一已安装 Pi 的参数处理和渲染组件复测（类型检查仍用项目依赖）。`tests/tool-pipeline.cjs` 兼容旧版准备入口和 Pi 1.0 的公开 `runToolCall`，两者都走真实 wrapper、参数准备和校验，不用 mock 代替。nullable 修补已在 Pi 0.85.1 与本机 Pi 1.0.0 完成全套回归；真实模型端仍需重载后验收。
 
 ## 后续计划
 
