@@ -8,6 +8,7 @@ import {
 	mkdirSync,
 	readdirSync,
 	readFileSync,
+	renameSync,
 	rmSync,
 	rmdirSync,
 	statSync,
@@ -16,6 +17,7 @@ import {
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, win32 } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { randomUUID } from "node:crypto";
 import { waitFor } from "./async";
 
 function expandHome(path: string): string {
@@ -283,6 +285,12 @@ export async function withRepoMutation<T>(
 			}
 		}
 		options.signal?.throwIfAborted();
+		const generation = randomUUID();
+		const temp = join(REPO, ".git", `.memark-version-${generation}.tmp`);
+		try {
+			writeFileSync(temp, generation + "\n", { flag: "wx", mode: 0o600 });
+			renameSync(temp, join(REPO, ".git", "memark-mutation-version"));
+		} finally { rmSync(temp, { force: true }); }
 		return await fn();
 	} catch (err) {
 		if (!locked && waiting.aborted) throw new Error(options.signal?.aborted ? "操作已取消" : "另一项记忆写入仍在进行，请稍后重试");

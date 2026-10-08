@@ -122,7 +122,7 @@ const load = (file) => import(pathToFileURL(file).href);
 	// 指纹测试只修改隔离副本，不动开发代码或真实安装。
 	const source = path.join(process.env.TEST_AGENT_DIR, "runtime-copy");
 	fs.mkdirSync(source, { recursive: true });
-	for (const file of ["package.json", "index.ts", "curator.ts", "repo.ts", "baseline.ts", "host-role.ts", "review-ui.ts", "diagnostics.ts", "metadata.ts", "async.ts"]) {
+	for (const file of ["package.json", "index.ts", "curator.ts", "repo.ts", "baseline.ts", "host-role.ts", "review-ui.ts", "diagnostics.ts", "metadata.ts", "async.ts", "sync.ts", "snapshot.ts"]) {
 		fs.copyFileSync(path.join(__dirname, "..", file), path.join(source, file));
 	}
 	const runtime = captureRuntime(source);

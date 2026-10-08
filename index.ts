@@ -2,7 +2,8 @@
  * memark — memory + markdown，pi 编码代理的长期记忆扩展。
  *
  * 当前版本：
- * - memark_recall：每个会话第一次实际查找时尝试同步；个人区 + 当前项目，支持显式跨项目
+ * - memark_recall：只读一致的本地快照；个人区 + 当前项目，支持显式跨项目
+ * - 后台下载：启动/恢复检查一小时新鲜度；存活期间定时检查，不阻塞 recall
  * - memark_remember：临时校验 → 修改预览 → 用户确认 → 精确提交；失败降级 pending
  * - /memory：status / sync / review / approve / reject / maintain / forget / edit / revert / host
  *
@@ -11,52 +12,64 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import {
 	PROJECTS_DIR,
 	REPO,
-	git,
 	isFormalMemoryPath,
 	readIndex,
 	resolveRepoPath,
-	unsafeWorktreeChanges,
-	withRepoMutation,
 } from "./repo";
 import { handleMemoryCommand, listPendingIds, registerCurator } from "./curator";
 import { buildBaselineContext } from "./baseline";
 import { readHostRole, saveHostRole } from "./host-role";
 import { currentMemory, matchesMemoryPath, parseMetadata } from "./metadata";
-import { waitFor } from "./async";
+import { captureMemorySnapshot, type MemorySnapshot } from "./snapshot";
+import { readSyncState, startBackgroundSync, syncIntervalMs } from "./sync";
 
 const MAX_OUTPUT_BYTES = 50 * 1024;
 const MAX_OUTPUT_LINES = 2000;
 const MAX_SCAN_CHARS_PER_FILE = 20_000;
-const RECALL_SYNC_TIMEOUT_MS = 5_000;
 
 function validProjectName(name: string): boolean {
 	return /^[\w\u4e00-\u9fff.-]+$/.test(name) && name !== "." && name !== ".." && !/[. ]$/.test(name) &&
 		!/^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(name);
 }
 
-function projectDirByName(name: string): string | null {
+function projectDirByName(name: string, snapshot?: MemorySnapshot): string | null {
 	if (!validProjectName(name)) return null;
 	try {
 		const dir = resolveRepoPath(`${PROJECTS_DIR}/${name}`).abs;
-		return existsSync(join(dir, "INDEX.md")) ? dir : null;
+		return (snapshot ? snapshot.read(`${PROJECTS_DIR}/${name}/INDEX.md`) !== null : existsSync(join(dir, "INDEX.md"))) ? dir : null;
 	} catch {
 		return null;
 	}
 }
 
-/** 从 cwd 向父目录查找第一个有对应项目记忆的目录名。 */
-function projectDirFor(cwd?: string): string | null {
+function candidateProjects(cwd?: string): string[] {
 	const explicit = process.env.MEMARK_PROJECT?.trim();
-	if (explicit) return projectDirByName(explicit);
+	if (explicit) return validProjectName(explicit) ? [explicit] : [];
+	if (!cwd) return [];
+	const names: string[] = [];
+	let current = resolve(cwd);
+	while (true) {
+		const name = basename(current);
+		if (validProjectName(name)) names.push(name);
+		const parent = dirname(current);
+		if (parent === current) return [...new Set(names)];
+		current = parent;
+	}
+}
+
+/** 从 cwd 向父目录查找第一个有对应项目记忆的目录名。 */
+function projectDirFor(cwd: string | undefined, snapshot: MemorySnapshot): string | null {
+	const explicit = process.env.MEMARK_PROJECT?.trim();
+	if (explicit) return projectDirByName(explicit, snapshot);
 	if (!cwd) return null;
 	let current = resolve(cwd);
 	while (true) {
-		const match = projectDirByName(basename(current));
+		const match = projectDirByName(basename(current), snapshot);
 		if (match) return match;
 		const parent = dirname(current);
 		if (parent === current) return null;
@@ -64,7 +77,8 @@ function projectDirFor(cwd?: string): string | null {
 	}
 }
 
-function allProjectIndexLines(): string[] {
+function allProjectIndexLines(snapshot?: MemorySnapshot): string[] {
+	if (snapshot) return snapshot.projects().filter(validProjectName).flatMap((name) => snapshot.index(name));
 	const root = join(REPO, PROJECTS_DIR);
 	if (!existsSync(root)) return [];
 	const lines: string[] = [];
@@ -148,14 +162,14 @@ export function matchIndexLines(lines: string[], query: string): string[] {
 
 interface RecallScope { project: string | null; allProjects: boolean }
 
-function safeReadMemory(rel: string, scope: RecallScope): string | null {
+function safeReadMemory(rel: string, scope: RecallScope, snapshot: MemorySnapshot): string | null {
 	try {
 		if (!isFormalMemoryPath(rel)) return null;
-		const { abs, rel: normalized } = resolveRepoPath(rel);
+		const { rel: normalized } = resolveRepoPath(rel);
 		const parts = normalized.split("/");
 		if (parts[0] === PROJECTS_DIR && (!validProjectName(parts[1]) || (!scope.allProjects && parts[1] !== scope.project))) return null;
-		if (!existsSync(abs)) return null;
-		const text = readFileSync(abs, "utf8");
+		const text = snapshot.read(normalized);
+		if (text === null) return null;
 		const fields = parseMetadata(text);
 		return fields && currentMemory(fields) && matchesMemoryPath(normalized, fields) ? text : null;
 	} catch {
@@ -163,21 +177,21 @@ function safeReadMemory(rel: string, scope: RecallScope): string | null {
 	}
 }
 
-function eligibleEntries(lines: string[], scope: RecallScope): string[] {
+function eligibleEntries(lines: string[], scope: RecallScope, snapshot: MemorySnapshot): string[] {
 	return lines.filter((line) => {
 		const rel = pathFromIndexLine(line);
-		return Boolean(rel && safeReadMemory(rel, scope));
+		return Boolean(rel && safeReadMemory(rel, scope, snapshot));
 	});
 }
 
-function fullTextMatches(lines: string[], query: string, excluded: Set<string>, scope: RecallScope): string[] {
+function fullTextMatches(lines: string[], query: string, excluded: Set<string>, scope: RecallScope, snapshot: MemorySnapshot): string[] {
 	const tokens = queryTokens(query);
 	const scored: { path: string; score: number; order: number }[] = [];
 	const paths = lines.map(pathFromIndexLine).filter((path): path is string => Boolean(path));
 	for (let i = 0; i < paths.length; i++) {
 		const path = paths[i];
 		if (excluded.has(path)) continue;
-		const text = safeReadMemory(path, scope);
+		const text = safeReadMemory(path, scope, snapshot);
 		if (!text) continue;
 		const low = text.slice(0, MAX_SCAN_CHARS_PER_FILE).toLocaleLowerCase();
 		const hits = tokens.filter((token) => low.includes(token)).length;
@@ -229,31 +243,23 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	let firstRecallSync: Promise<string | null> | null = null;
-
-	async function syncBeforeFirstRecall(): Promise<string | null> {
-		if (firstRecallSync) return firstRecallSync;
-		const signal = AbortSignal.timeout(RECALL_SYNC_TIMEOUT_MS);
-		const deadline = Date.now() + RECALL_SYNC_TIMEOUT_MS;
-		const options = () => {
-			signal.throwIfAborted();
-			return { signal, timeout: Math.max(1, deadline - Date.now()) };
-		};
-		firstRecallSync = waitFor(withRepoMutation(async () => {
-			if (!existsSync(join(REPO, ".git"))) return `记忆仓库不存在或尚未初始化：${REPO}`;
-			const dirty = await unsafeWorktreeChanges(pi, options());
-			if (dirty.length > 0) return `记忆仓库有未处理修改，未自动下载最新版本：${dirty.map((item) => item.path).join(", ")}`;
-			const result = await git(pi, ["pull", "--ff-only", "--quiet"], options());
-			return result.code === 0 ? null : `自动同步失败，当前使用本地记忆：${(result.stderr || result.stdout).trim()}`;
-		}, { waitMs: 500, signal }), signal).catch((err) => `自动同步失败，当前使用本地记忆：${(err as Error).message}`);
-		return firstRecallSync;
-	}
+	let stopSync: (() => Promise<void>) | null = null;
+	pi.on("session_start", async () => {
+		try {
+			if (stopSync) await stopSync();
+			stopSync = startBackgroundSync(pi);
+		} catch { /* Background setup must not block normal conversation. */ }
+	});
+	pi.on("session_shutdown", async () => {
+		try { const stop = stopSync; stopSync = null; await stop?.(); }
+		catch { /* Shutdown remains safe if an exec was already cancelled by the host. */ }
+	});
 
 	pi.registerTool({
 		name: "memark_recall",
 		label: "Memory Recall",
 		description:
-			"检索 Markdown 长期记忆库。每个会话第一次调用时先尝试在 5 秒内下载最新版本；失败则使用本地快照。" +
+			"检索 Markdown 长期记忆库，只读一致的本地快照，不等待网络。后台默认按一小时新鲜度下载；立即完整同步用 /memory sync。" +
 			"默认范围为个人区加当前项目；all_projects=true 时显式检索全部项目。先匹配索引，再以正文关键词补充。" +
 			"过期记忆不会返回。最多返回 10 个文件，总输出不超过 50KB/2000 行。",
 		promptSnippet: "Search reviewed long-term memories relevant to the current task",
@@ -268,15 +274,17 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			try {
 				if (signal?.aborted) throw new Error("操作已取消");
-				const syncWarning = await waitFor(syncBeforeFirstRecall(), signal);
-				const projectDir = projectDirFor(ctx?.cwd);
+				const snapshot = captureMemorySnapshot({ projects: params.all_projects ? "all" : candidateProjects(ctx?.cwd) });
+				const projectDir = projectDirFor(ctx?.cwd, snapshot);
 				const scope: RecallScope = { project: projectDir ? basename(projectDir) : null, allProjects: params.all_projects === true };
-				const personalLines = readIndex();
+				const personalLines = snapshot.index();
 				const projectLines = params.all_projects
-					? allProjectIndexLines()
-					: projectDir ? readIndex(projectDir) : [];
-				const lines = eligibleEntries([...personalLines, ...projectLines], scope);
-				const prefix = syncWarning ? `⚠ ${syncWarning}\n\n` : "";
+					? allProjectIndexLines(snapshot)
+					: projectDir ? snapshot.index(basename(projectDir)) : [];
+				const lines = eligibleEntries([...personalLines, ...projectLines], scope, snapshot);
+				const state = readSyncState();
+				const stale = !state?.lastSuccess || state.lastSuccess > Date.now() || Date.now() - state.lastSuccess >= syncIntervalMs();
+				const prefix = stale ? "ℹ 使用本地记忆快照；后台下载不阻塞查询，同步状态见 /memory status。\n\n" : "";
 				if (lines.every((line) => !line.includes(".md"))) {
 					return { content: [{ type: "text", text: `${prefix}memark：没有可用的正式记忆索引（${REPO}）。` }], details: {} };
 				}
@@ -285,12 +293,12 @@ export default function (pi: ExtensionAPI) {
 				const ranked = matchIndexLines(lines, params.query);
 				const combined = [...ranked];
 				if (combined.length < maxFiles) {
-					combined.push(...fullTextMatches(lines, params.query, new Set(combined), scope));
+					combined.push(...fullTextMatches(lines, params.query, new Set(combined), scope, snapshot));
 				}
 				const selected = [...new Set(combined)].slice(0, maxFiles);
 				const parts: string[] = [];
 				for (const rel of selected) {
-					const text = safeReadMemory(rel, scope);
+					const text = safeReadMemory(rel, scope, snapshot);
 					if (!text) continue;
 					parts.push(`===== ${rel} =====\n${text}`);
 				}

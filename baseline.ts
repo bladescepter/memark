@@ -1,7 +1,7 @@
 /** 每轮运行环境 + 少量已审核的个人记忆；只读本地快照，不产生写入或网络请求。 */
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { platform } from "node:os";
-import { readIndex, resolveRepoPath } from "./repo";
+import { captureMemorySnapshot } from "./snapshot";
 import { normalizeHostRole, readHostRole } from "./host-role";
 import { currentMemory, parseMetadata } from "./metadata";
 
@@ -62,7 +62,8 @@ function reviewedSummary(text: string, layer: Layer): string | null {
 
 function stableSummaries(): Record<Layer, string[]> {
 	const result: Record<Layer, string[]> = { identity: [], principles: [], preferences: [] };
-	const lines = readIndex();
+	const snapshot = captureMemorySnapshot({ layers: LAYERS, projects: [] });
+	const lines = snapshot.index();
 	// 同一层内优先收纳安全、权限和备份类原则；不让索引字典序决定核心纪律。
 	const priority = (line: string) => /—\s*principles\//.test(line) &&
 		/(安全|权限|备份|隐私|密钥|security|permission|backup|privacy|secret)/i.test(line) ? 1 : 0;
@@ -75,11 +76,9 @@ function stableSummaries(): Record<Layer, string[]> {
 		const layer = parts[0] as Layer;
 		if (result[layer].length >= LIMITS[layer]) continue;
 		try {
-			const { abs } = resolveRepoPath(rel);
-			if (!existsSync(abs)) continue;
-			const stats = statSync(abs);
-			if (!stats.isFile() || stats.size > MAX_FILE_BYTES) continue;
-			const summary = reviewedSummary(readFileSync(abs, "utf8"), layer);
+			const text = snapshot.read(rel);
+			if (text === null || Buffer.byteLength(text, "utf8") > MAX_FILE_BYTES) continue;
+			const summary = reviewedSummary(text, layer);
 			if (summary) result[layer].push(summary);
 		} catch { /* 不可读、不安全或格式不符的记忆不注入。 */ }
 	}

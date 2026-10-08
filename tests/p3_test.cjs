@@ -25,6 +25,7 @@ const jiti = createJiti(__filename, {
 const mod = jiti(path.join(__dirname, "..", "index.ts"));
 const repoMod = jiti(path.join(__dirname, "..", "repo.ts"));
 const baselineMod = jiti(path.join(__dirname, "..", "baseline.ts"));
+const syncMod = jiti(path.join(__dirname, "..", "sync.ts"));
 
 const REPO = process.env.MEMARK_REPO;
 const BARE = process.env.TEST_REMOTE;
@@ -225,14 +226,22 @@ function addRemoteMemory() {
 	}
 	assert((await git(["status", "--porcelain"])).stdout.trim() === "", "基线测试后隔离仓库无改动");
 
-	// 2. 第一次 recall 才同步，之后不重复；会话开始不再同步。
-	assert(handlers.session_start === undefined, "不再在会话开始时自动同步");
+	// 2. recall 不联网；session_start 启动后台下载，完成后本地查询可见新记忆。
+	assert(typeof handlers.session_start === "function" && typeof handlers.session_shutdown === "function", "后台同步生命周期已注册");
+	assert(pullCount === 0, "工厂加载与基线注入都不联网");
 	addRemoteMemory();
-	let result = await tools.memark_recall.execute("r1", { query: "远端同步唯一正文", max_files: 2 }, undefined, undefined, { cwd: "/workspace/none" });
-	assert(toolText(result).includes("远端同步标记"), "第一次 recall 先拉取远端再检索");
-	assert(pullCount === 1, "第一次 recall 只同步一次");
+	let result = await tools.memark_recall.execute("r0", { query: "远端同步唯一正文", max_files: 2 }, undefined, undefined, { cwd: "/workspace/none" });
+	assert(!toolText(result).includes("远端同步标记") && pullCount === 0, "首次 recall 立即读本地，不拉取远端");
+	await handlers.session_start();
+	const syncDeadline = Date.now() + 5000;
+	while (!syncMod.readSyncState()?.lastSuccess && Date.now() < syncDeadline) await new Promise(resolve => setTimeout(resolve, 10));
+	assert(Boolean(syncMod.readSyncState()?.lastSuccess), "后台下载在隔离真实 Git 远端成功");
+	result = await tools.memark_recall.execute("r1", { query: "远端同步唯一正文", max_files: 2 }, undefined, undefined, { cwd: "/workspace/none" });
+	assert(toolText(result).includes("远端同步标记"), "后台完成后 recall 读取最新本地记忆");
+	assert(pullCount === 1, "后台只下载一次");
 	await tools.memark_recall.execute("r2", { query: "备份" }, undefined, undefined, { cwd: "/workspace/none" });
-	assert(pullCount === 1, "同一会话后续 recall 不重复同步");
+	assert(pullCount === 1, "后续 recall 不触发网络请求");
+	await handlers.session_shutdown();
 	result = await tools.memark_recall.execute("r3", { query: "单写者", max_files: 2 }, undefined, undefined, { cwd: "/workspace/wiki/subdir" });
 	assert(toolText(result).includes("projects/wiki/topics/单写者纪律.md"), "从项目子目录也能识别当前项目");
 	result = await tools.memark_recall.execute("r4", { query: "跨项目唯一正文" }, undefined, undefined, { cwd: "/workspace/wiki" });
@@ -254,7 +263,7 @@ function addRemoteMemory() {
 	};
 	mod.default(failPi);
 	result = await failTools.memark_recall.execute("rf", { query: "备份" }, undefined, undefined, { cwd: "/workspace/none" });
-	assert(toolText(result).includes("自动同步失败") && toolText(result).includes("清理前先备份"), "同步失败时提示并继续使用本地记忆");
+	assert(!toolText(result).includes("自动同步失败") && toolText(result).includes("清理前先备份"), "断网不影响本地 recall，也不重复旧同步失败警告");
 
 	// 3. 输入校验。
 	try {

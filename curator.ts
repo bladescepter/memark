@@ -22,6 +22,7 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { runtime } from "./diagnostics";
+import { backgroundSyncStatus, cancelBackgroundDownload, recordSyncSuccess } from "./sync";
 import { showReview, type ReviewContext } from "./review-ui";
 import { parseMetadata, parseSimpleFrontmatter, rewriteMemory, validDate } from "./metadata";
 export { parseSimpleFrontmatter } from "./metadata";
@@ -897,6 +898,7 @@ async function syncRepository(pi: ExtensionAPI): Promise<WriteResult> {
 		}
 		const pull = await git(pi, ["pull", "--ff-only"], { timeout: 60_000 });
 		if (pull.code !== 0) return { success: false, text: `下载失败：${(pull.stderr || pull.stdout).trim()}` };
+		try { recordSyncSuccess(); } catch { /* Local diagnostics cannot prevent explicit sync. */ }
 
 		const indexCheck = await runRepoScript(pi, "generate_index.py", ["--check"], { timeout: WRITE_TIMEOUT_MS });
 		if (indexCheck.code !== 0) {
@@ -1024,7 +1026,7 @@ export async function handleMemoryCommand(pi: ExtensionAPI, args: string, ctx: C
 		notify(
 			`memark @ ${REPO}\n个人区索引条目: ${entries}  待审核: ${pending}  git: ${branch}` +
 			`${changes.length ? `（${changes.length} 处未处理）` : "（干净）"}${relation}\n${counts}\n项目区: ${projectInfo}\n` +
-			"第一次查找记忆时会尝试下载最新版本；完整同步用 /memory sync。",
+			backgroundSyncStatus(),
 			"info",
 		);
 		return;
@@ -1172,6 +1174,7 @@ export async function handleMemoryCommand(pi: ExtensionAPI, args: string, ctx: C
 
 	if (cmd === "sync") {
 		try {
+			await cancelBackgroundDownload();
 			const result = await syncRepository(pi);
 			notify(result.text, result.success ? "info" : "error");
 		} catch (err) {

@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const SOURCE_FILES = ["package.json", "index.ts", "curator.ts", "repo.ts", "baseline.ts", "host-role.ts", "review-ui.ts", "diagnostics.ts", "metadata.ts", "async.ts"];
+const SOURCE_FILES = ["package.json", "index.ts", "curator.ts", "repo.ts", "baseline.ts", "host-role.ts", "review-ui.ts", "diagnostics.ts", "metadata.ts", "async.ts", "sync.ts", "snapshot.ts"];
 export function captureRuntime(root: string) {
 	const readBuild = () => {
 		const version = String(JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version);

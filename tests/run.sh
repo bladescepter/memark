@@ -46,3 +46,4 @@ git -C "$TEST_REPO" config core.quotepath false
 node "$HERE/review_test.cjs"
 node "$HERE/p3_test.cjs"
 node "$HERE/safety_test.cjs"
+node "$HERE/sync_test.cjs"

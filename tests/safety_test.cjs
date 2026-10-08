@@ -193,7 +193,7 @@ function freshRecall(exec = pi.exec) {
 	const fresh = freshRecall((cmd, args, opts) => { if (args.includes("pull")) pulled++; return pi.exec(cmd, args, opts); });
 	const started = Date.now();
 	const quick = await bounded(recall("测试身份", fresh));
-	assert(Date.now() - started < 2500 && quick.includes("自动同步失败") && quick.includes("测试身份"));
+	assert(Date.now() - started < 2500 && !quick.includes("自动同步失败") && quick.includes("测试身份"));
 	await assert.rejects(bounded(repo.withRepoMutation(async () => { expiredTurnRan = true; }, { waitMs: 30 })), /另一项记忆写入/);
 	const cancelled = new AbortController();
 	const cancelledTurn = repo.withRepoMutation(async () => { expiredTurnRan = true; }, { signal: cancelled.signal });
@@ -201,20 +201,14 @@ function freshRecall(exec = pi.exec) {
 	holdRelease.resolve(); await held;
 	await repo.withRepoMutation(async () => {});
 	assert.equal(pulled, 0); assert.equal(expiredTurnRan, false);
-	console.log("✓ recall 不等待审核长队列；排队超时/取消的任务不会迟到执行或越过写入者");
+	console.log("✓ recall 不等待后台/审核写入；排队超时/取消的任务不会迟到执行或越过写入者");
 
-	let slowOptions, latePulls = 0;
-	const slow = freshRecall((cmd, args, opts) => {
-		if (args.includes("status")) { slowOptions = opts; return new Promise(resolve => setTimeout(() => resolve({ code: 0, stdout: "", stderr: "", killed: false }), 6000)); }
-		if (args.includes("pull")) latePulls++;
-		return pi.exec(cmd, args, opts);
-	});
-	const fallback = await bounded(recall("测试身份", slow), 5700);
-	assert(fallback.includes("自动同步失败") && fallback.includes("测试身份"));
-	assert(slowOptions.signal.aborted && slowOptions.timeout <= 5000);
-	await bounded(repo.withRepoMutation(async () => {}));
-	assert.equal(latePulls, 0);
-	console.log("✓ 五秒总预算包含慢 Git status，超时后不迟到启动 pull");
+	let recallExecs = 0;
+	const slow = freshRecall(() => { recallExecs++; throw new Error("recall must not start network or Git status"); });
+	const fallback = await bounded(recall("测试身份", slow));
+	assert(fallback.includes("测试身份") && !fallback.includes("自动同步失败"));
+	assert.equal(recallExecs, 0);
+	console.log("✓ recall 不再执行同步或等待五秒预算");
 
 	await remember({ ...draft("坏链接候选"), body: "[不存在](missing.md)", as_pending: true }); id = pendingId();
 	assert(txt(await remember(draft("无关候选隔离写入"))).startsWith("✓"));
