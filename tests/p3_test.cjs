@@ -133,7 +133,8 @@ function addRemoteMemory() {
 
 	// 1b. 基线：每轮本机环境 + 本地已审核个人记忆；不做远端请求或写入。
 	assert(typeof handlers.before_agent_start === "function", "每轮主机与基线注入已注册");
-	const promptEvent = { systemPrompt: "原始系统提示" };
+	const promptEvent = { type: "before_agent_start", messageType: "user", prompt: "测试用户输入", systemPrompt: "原始系统提示" };
+	const customEvent = { type: "before_agent_start", messageType: "custom", message: { customType: "test", content: "自动任务", display: false }, systemPrompt: "原始系统提示" };
 	const promptCtx = { cwd: "/workspace/wiki", hasUI: false, mode: "rpc" };
 	const initialPullCount = pullCount;
 	const roleFile = path.join(process.env.TEST_AGENT_DIR, "memark", "host-role.json");
@@ -163,12 +164,18 @@ function addRemoteMemory() {
 	assert(prompt.includes("本机角色：未确认") && !fs.existsSync(roleFile), "不合法输入不会保存或注入");
 	inputImpl = async () => "VPS";
 	inputCount = 0;
+	// 自动任务不询问或消耗首次用户输入的提示机会，但始终注入基线。
+	prompt = (await handlers.before_agent_start(customEvent, ctx)).systemPrompt;
+	assert(inputCount === 0 && !fs.existsSync(roleFile), "自动任务不弹出角色询问，也不创建本机配置");
+	assert(prompt.includes("本机角色：未确认") && prompt.includes("测试身份"), "自动任务仍注入本机环境和已审核个人基线");
 	// 交互模式首次触发用户设定，随后只读本机配置；完全忽略旧环境变量。
 	process.env.MEMARK_HOST_ROLE = "环境变量不再生效";
 	process.env.MEMARK_HOSTNAME = "old-host";
 	prompt = (await handlers.before_agent_start(promptEvent, ctx)).systemPrompt;
 	assert(inputCount === 1 && prompt.includes("本机角色：VPS") && fs.existsSync(roleFile), "首次交互提示并保存到独立本机目录");
 	assert(JSON.parse(fs.readFileSync(roleFile, "utf8")).role === "VPS", "本机角色配置不写入记忆仓库");
+	prompt = (await handlers.before_agent_start(customEvent, ctx)).systemPrompt;
+	assert(inputCount === 1 && prompt.includes("本机角色：VPS") && prompt.includes("测试身份"), "角色已设置后自动任务仍只读配置并注入基线");
 	if (process.platform !== "win32") assert((fs.statSync(roleFile).mode & 0o777) === 0o600, "本机角色文件仅当前用户可读写");
 	prompt = (await handlers.before_agent_start(promptEvent, ctx)).systemPrompt;
 	assert(inputCount === 1 && prompt.split("当前 Pi 进程运行环境").length === 2, "后续轮次不再提示，每轮基线不累积");
@@ -354,6 +361,7 @@ function addRemoteMemory() {
 	assert(JSON.stringify(tools.memark_remember.parameters.properties.category.anyOf?.[0].enum) === JSON.stringify(["current", "relationships"]), "模型 schema 的非空 category 仍仅允许 Context 分类");
 
 	// 同时模拟标准 strict 转换和只把字段改为必填的代理，先验证请求再走真实执行链。
+	// pi-ai subpaths are import-only; locate their files relative to the tested SDK.
 	const aiRoot = sdkRequire.resolve.paths("@earendil-works/pi-ai")
 		.map((root) => path.join(root, "@earendil-works/pi-ai"))
 		.find((root) => fs.existsSync(path.join(root, "dist/api/constrained-sampling.js")));

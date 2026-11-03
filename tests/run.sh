@@ -43,6 +43,7 @@ git -C "$TEST_REPO" config user.name memark-test
 git -C "$TEST_REPO" config core.hooksPath .githooks
 git -C "$TEST_REPO" config core.quotepath false
 
+node "$HERE/loader_test.cjs"
 node "$HERE/review_test.cjs"
 node "$HERE/p3_test.cjs"
 node "$HERE/safety_test.cjs"

@@ -219,11 +219,11 @@ function truncateOutput(text: string): string {
 
 export default function (pi: ExtensionAPI) {
 	let rolePrompted = false;
-	// 首次交互才请用户声明当前 Pi 主机的角色；无 UI 或取消时不猜测、不保存。
+	// 仅用户输入触发首次角色询问；自动任务只注入基线，无 UI 或取消时不猜测、不保存。
 	// 系统提示仅在本轮有效，不往会话历史或共享仓库写入动态主机信息。
 	pi.on("before_agent_start", async (event, ctx) => {
 		try {
-			if (!readHostRole() && ctx.hasUI && !rolePrompted) {
+			if (event.messageType === "user" && !readHostRole() && ctx.hasUI && !rolePrompted) {
 				rolePrompted = true;
 				try {
 					const input = await ctx.ui.input("memark：首次使用，请设置当前 Pi 运行机器的角色", "例如 VPS、工作电脑、家庭电脑、Linux 笔记本");

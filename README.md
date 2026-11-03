@@ -41,15 +41,15 @@ pi install git:github.com/bladescepter/memark
 pi update --extensions
 ```
 
-需 Node.js 22.19+、Pi 0.85.1 或更新版本。安装或更新后，在**实际执行工具的每个 Pi 实例**中执行 `/reload`，再用 `/memory status` 核对运行版本、加载路径与磁盘指纹。磁盘代码已更新不代表旧进程已加载；`/memory sync` 只同步记忆数据，不升级扩展。
+需 Node.js 22.19+、Pi 1.5.0 或更新版本。本扩展为个人自用，开发依赖与 CI 跟随当前使用的 Pi 版本，不再维护旧版兼容。安装或更新后，在**实际执行工具的每个 Pi 实例**中执行 `/reload`，再用 `/memory status` 核对运行版本、加载路径与磁盘指纹。磁盘代码已更新不代表旧进程已加载；`/memory sync` 只同步记忆数据，不升级扩展。
 
 记忆仓库路径由 `MEMARK_REPO` 指定，默认 `~/DEV/memory`；项目名默认从当前目录及其父目录中匹配，也可用 `MEMARK_PROJECT` 指定。
 
-## 当前功能（v0.3.6）
+## 当前功能（v0.3.7）
 
-v0.3.6 将首次 recall 的五秒阻塞同步改为一小时新鲜度后台下载，加入多会话/进程去重、失败退避、退出取消和一致本地快照；用户审核与正式写入规则不变。作为未固定旧引用的 Git 包安装时，运行 `pi update --extensions` 更新，再在每个 Pi 实例 `/reload`，用 `/memory status` 确认运行版本为 `0.3.6` 和代码指纹。
+v0.3.7 将开发依赖与 CI 统一到 Pi 1.5.0，移除旧版工具执行入口的测试适配。首次主机角色询问仅在 `messageType=user` 且有 UI 时触发；扩展自动触发的 `custom` 运行仍注入本机环境和已审核个人基线，但不弹窗，也不消耗首次用户输入的提示机会。用户审核与正式写入规则不变。作为未固定旧引用的 Git 包安装时，运行 `pi update --extensions` 更新，再在每个 Pi 实例 `/reload`，用 `/memory status` 确认运行版本为 `0.3.7` 和代码指纹。
 
-v0.3.5 的可选参数 nullable 兼容与 Pi 1.0 测试入口继续保留；不适用字段可省略或传 `null`，真实冲突仍拒绝。
+v0.3.6 的一小时新鲜度后台下载、跨会话/进程去重、失败退避、退出取消和一致本地快照继续保留。可选参数仍可省略或传 `null`，真实冲突仍拒绝；这是模型参数处理语义，不随旧版 Pi 适配移除。
 
 本次不修改 memory 数据协议。若从 v0.3.4 之前升级，还需同步私有 `memory` 仓库的配套 `scripts/validate.py` 修复：候选链接不再参与正式区检查，批准时仍按正式目标校验。仅更新扩展不能替代协议脚本更新。
 
@@ -82,7 +82,7 @@ v0.3.5 的可选参数 nullable 兼容与 Pi 1.0 测试入口继续保留；不�
 
 - 每轮 `before_agent_start` 注入的**主机信息仅为本机角色和实时 OS**，不注入设备 ID、hostname 或工作目录；即使从 PC 浏览器访问 pi-web，Agent 的执行主机仍是 VPS。远程工具执行目标需另外核对。
 - 同时读取本地已审核、active、未过期的个人身份/原则/偏好标题与描述；不读取项目记忆、不在每轮联网、不写入 Git。注入长度限制为 480 字符 / 1100 UTF-8 字节（具体 token 数依模型验证）。本地快照可通过 `/memory sync` 更新。
-- 新机器首次交互对话时，扩展提示用户设置**当前 Pi 运行机器**的角色（如 `VPS`、`工作电脑`、`家庭电脑`、`Linux 笔记本`）；保存于本机 Pi 配置目录 `~/.pi/agent/memark/host-role.json`（若设置 `PI_CODING_AGENT_DIR` 则随之改变），不进入共享记忆仓库。可用 `/memory host` 查看、`/memory host set <角色>` 修改。扩展不读取 hostname，也不使用角色环境变量；无交互界面或取消时显示“未确认”，下次新会话可重试。pi-web 应设置 VPS 的角色，而非浏览器所在 PC 的角色。
+- 新机器首次用户输入触发且有 UI 时（`messageType=user`），扩展提示用户设置**当前 Pi 运行机器**的角色（如 `VPS`、`工作电脑`、`家庭电脑`、`Linux 笔记本`）；保存于本机 Pi 配置目录 `~/.pi/agent/memark/host-role.json`（若设置 `PI_CODING_AGENT_DIR` 则随之改变），不进入共享记忆仓库。可用 `/memory host` 查看、`/memory host set <角色>` 修改。扩展不读取 hostname，也不使用角色环境变量；无交互界面或取消时显示“未确认”，下次新会话可重试。pi-web 应设置 VPS 的角色，而非浏览器所在 PC 的角色。
 
 ### 受控写入
 
@@ -132,15 +132,15 @@ v0.3.5 的可选参数 nullable 兼容与 Pi 1.0 测试入口继续保留；不�
 npm test
 ```
 
-测试先执行严格的 TypeScript 类型检查，再使用 `tests/fixtures/memory/` 中完全虚构的独立记忆库；不读取私人 `~/DEV/memory`。覆盖本地快照/后台下载、项目隔离、待审核批准/拒绝、确认前编辑、原地编辑、敏感信息、路径越界、失败恢复、并发写入、远端竞态、归档、撤销、索引修复和基线/本机角色注入。
+v0.3.7 已在本机 Pi 1.5.0 依赖下通过完整 `npm test`（含严格类型检查）；实际客户端重载与交互仍需人工验收。测试先执行严格的 TypeScript 类型检查，再使用 `tests/fixtures/memory/` 中完全虚构的独立记忆库；不读取私人 `~/DEV/memory`。覆盖本地快照/后台下载、项目隔离、待审核批准/拒绝、确认前编辑、原地编辑、敏感信息、路径越界、失败恢复、并发写入、远端竞态、归档、撤销、索引修复和基线/本机角色注入。
 
-分类测试经过真实 Pi wrapper → prepareArguments → schema 校验链，并用被测 Pi 的 strict schema 转换/校验模块及只强制全字段必填的代理形式验证 nullable 请求，覆盖 Learning 审核拒绝/批准、Context/项目/Handoff 归属及条件必填、原地编辑和真实冲突拒绝；`tests/review_test.cjs` 使用真实 Pi 普通/全屏 overlay 合成器，覆盖长预览、中文宽字符、窗口缩放、固定按钮、键盘/取消、RPC 完整滚动预览与版本漂移。完整工具流程还覆盖新项目批准/取消、Edit 改归属及失败后保留最新 pending。GitHub 对 Pi 0.85.1 / 0.87.1 运行同一套测试；这不替代各机实际终端或 RPC 客户端的人工验收。
+分类测试经过真实 Pi wrapper → prepareArguments → schema 校验链，并用被测 Pi 的 strict schema 转换/校验模块及只强制全字段必填的代理形式验证 nullable 请求，覆盖 Learning 审核拒绝/批准、Context/项目/Handoff 归属及条件必填、原地编辑和真实冲突拒绝；`tests/review_test.cjs` 使用真实 Pi 普通/全屏 overlay 合成器，覆盖长预览、中文宽字符、窗口缩放、固定按钮、键盘/取消、RPC 完整滚动预览与版本漂移。完整工具流程还覆盖新项目批准/取消、Edit 改归属及失败后保留最新 pending。GitHub 使用锁定的 Pi 1.5.0 依赖运行同一套测试，不再测试旧版本；这不替代各机实际终端或 RPC 客户端的人工验收。
 
 `tests/safety_test.cjs` 覆盖真实 Pi 文件队列竞争、忽略文件碰撞、pending 版本竞争/拒绝、新项目失败回滚、陈旧或错区索引、引号/null 元数据、非阻塞本地读取、候选链接隔离，以及完整预检撤销。文件队列不再用“直接执行回调”的 mock 代替。
 
 `tests/sync_test.cjs` 使用虚构远端验证一小时新鲜度、共享调度/成功时间、真实 Pi 工厂恢复生命周期、网络退避、鉴权/非快进分类、未提交修改保护、超时/退出取消、写入中的一致快照、禁用 hook 和覆盖 rebase 配置，以及两个真实 Node 进程只 pull 一次。时间推进使用注入时钟，不等待真实一小时；不替代实际 pi-web 闲置回收与 herdr 重启验收。
 
-可用 `MEMARK_TEST_PI_ROOT=/实际安装的/pi-coding-agent npm test` 对另一已安装 Pi 的参数处理和渲染组件复测（类型检查仍用项目依赖）。`tests/tool-pipeline.cjs` 兼容旧版准备入口和 Pi 1.0 的公开 `runToolCall`，两者都走真实 wrapper、参数准备和校验，不用 mock 代替。nullable 修补已在 Pi 0.85.1 与本机 Pi 1.0.0 完成全套回归；真实模型端仍需重载后验收。
+`tests/loader_test.cjs` 使用 Pi 1.5 的真实扩展加载器，不替换模块，覆盖工具/命令注册、自动任务不询问角色、首次用户输入仍可询问以及取消后不重复提示；不启动模型或后台同步。`tests/tool-pipeline.cjs` 直接使用当前 Pi 的 `runToolCall`，走真实 wrapper、参数准备和校验，不保留旧版入口分支。可用 `MEMARK_TEST_PI_ROOT=/实际安装的/pi-coding-agent npm test` 对另一已安装的当前 Pi 复测参数处理、加载器和渲染组件（类型检查仍用项目依赖）；真实模型端仍需重载后验收。
 
 ## 后续计划
 
