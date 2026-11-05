@@ -259,8 +259,7 @@ export default function (pi: ExtensionAPI) {
 		name: "memark_recall",
 		label: "Memory Recall",
 		description:
-			"检索 Markdown 长期记忆库，只读一致的本地快照，不等待网络。后台默认按一小时新鲜度下载；立即完整同步用 /memory sync。" +
-			"默认范围为个人区加当前项目；all_projects=true 时显式检索全部项目。先匹配索引，再以正文关键词补充。" +
+			"检索 Markdown 长期记忆库的本地快照，不等待网络。默认范围为个人区加当前项目；all_projects=true 时检索全部项目。" +
 			"过期记忆不会返回。最多返回 10 个文件，总输出不超过 50KB/2000 行。",
 		promptSnippet: "Search reviewed long-term memories relevant to the current task",
 		promptGuidelines: [
